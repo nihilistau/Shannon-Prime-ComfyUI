@@ -1,0 +1,202 @@
+Prestartup Skipping comfyui-easy-use due to disable_all_custom_nodes and whitelist_custom_nodes
+Prestartup Skipping comfyui-manager due to disable_all_custom_nodes and whitelist_custom_nodes
+Prestartup Skipping rgthree-comfy due to disable_all_custom_nodes and whitelist_custom_nodes
+WARNING: You need pytorch with cu130 or higher to use optimized CUDA operations.
+Found comfy_kitchen backend cuda: {'available': True, 'disabled': True, 'unavailable_reason': None, 'capabilities': ['apply_rope', 'apply_rope1', 'dequantize_nvfp4', 'dequantize_per_tensor_fp8', 'quantize_mxfp8', 'quantize_nvfp4', 'quantize_per_tensor_fp8', 'scaled_mm_nvfp4']}
+Found comfy_kitchen backend triton: {'available': False, 'disabled': True, 'unavailable_reason': "ImportError: No module named 'triton'", 'capabilities': []}
+Found comfy_kitchen backend eager: {'available': True, 'disabled': False, 'unavailable_reason': None, 'capabilities': ['apply_rope', 'apply_rope1', 'dequantize_nvfp4', 'dequantize_per_tensor_fp8', 'quantize_nvfp4', 'quantize_per_tensor_fp8', 'scaled_mm_nvfp4']}
+Checkpoint files will always be loaded safely.
+Total VRAM 12288 MB, total RAM 32284 MB
+pytorch version: 2.5.1+cu121
+Set vram state to: NORMAL_VRAM
+Device: cuda:0 NVIDIA GeForce RTX 2060 : cudaMallocAsync
+Using async weight offloading with 2 streams
+Enabled pinned memory 14527.0
+Torch version too old to set sdpa backend priority.
+Using pytorch attention
+Unsupported Pytorch detected. DynamicVRAM support requires Pytorch version 2.8 or later. Falling back to legacy ModelPatcher. VRAM estimates may be unreliable especially on Windows
+Python version: 3.11.2 (tags/v3.11.2:878ead1, Feb  7 2023, 16:38:35) [MSC v.1934 64 bit (AMD64)]
+ComfyUI version: 0.15.1
+ComfyUI frontend version: 1.39.19
+[Prompt Server] web root: D:\ComfyUI\.venv\Lib\site-packages\comfyui_frontend_package\static
+Skipping a-person-mask-generator due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping bjornulf_custom_nodes due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping Boyonodes due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping cache-cleaner due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping cg-use-everywhere due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfy-asset-downloader due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfy-cup due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfy-mtb due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping ComfyLiterals due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping ComfyMath due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping ComfyUI-3D-Pack due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping ComfyUI-Addoor due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-advanced-controlnet due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-art-venture due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-custom-scripts due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-depthanythingv2 due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-diffusersloader due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-dirgir due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping ComfyUI-DistorchMemoryManager due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-easy-use due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-elegant-resource-monitor due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping Comfyui-ergouzi-Nodes due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-florence2 due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-frame-interpolation due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping ComfyUI-FramePackWrapper_Plus due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping ComfyUI-FramePackWrapper_PlusOne due to disable_all_custom_nodes and whitelist_custom_nodes
+ComfyUI-GGUF: Partial torch compile only, consider updating pytorch
+Skipping ComfyUI-GIMM-VFI due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-hunyuanvideowrapper due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-if_llm due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-image-saver due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-image-selector due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-impact-pack due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-impact-subpack due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-inspire-pack due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-kjnodes due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-lmstudio-image-to-text-node due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-lora-manager due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping ComfyUI-LTXVideo due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-manager due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping ComfyUI-MelBandRoFormer due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping ComfyUI-MiniCPM due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-mixlab-nodes due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-mmaudio due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-mxtoolkit due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping ComfyUI-Qwen-VL due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping ComfyUI-Qwen3-ASR due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping ComfyUI-Qwen3-TTS due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping ComfyUI-QwenASR due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping ComfyUI-QwenVL due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-reactor due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping ComfyUI-RequestNodes due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-rmbg due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-sam2 due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping ComfyUI-SaveAsScript due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-seedvr2-tilingupscaler due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-segment-anything-2 due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping ComfyUI-SoundHub due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping ComfyUI-SuperUltimateVaceTools due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-supir due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-to-python-extension due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping ComfyUI-TypeAux due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping ComfyUI-UltimateSDUpscale-GGUF due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-various due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-videodircombiner due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-videohelpersuite due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping ComfyUI-WanVideoWrapper due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui-web-viewer due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping ComfyUI_Comfyroll_CustomNodes due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui_controlnet_aux due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui_essentials due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui_human_parts due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui_ipadapter_plus due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui_ipadapter_plus_v2 due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping ComfyUI_JPS-Nodes due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui_kimnodes due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui_LLM_party due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui_memory_cleanup due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping ComfyUI_NetDist due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping Comfyui_PDuse due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui_ryanonyheinside due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui_sageutils due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui_tensorrt due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping comfyui_tinyterranodes due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping derfuu_comfyui_moddednodes due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping efficiency-nodes-comfyui due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping gguf due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping Listhelper due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping mikey_nodes due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping pixeloe due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping qwen3-vl-nsfw due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping RES4LYF due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping rgthree-comfy due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping save-image-extended-comfyui due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping save-images-as-video due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping seedvr2_videoupscaler due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping show_seed due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping stablediffusion-dpmpp_2m_alt-sampler due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping wanblockswap due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping wanvaceadvanced due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping websocket_image_save.py due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping wywywywy-pause due to disable_all_custom_nodes and whitelist_custom_nodes
+Skipping YANC_LMStudio due to disable_all_custom_nodes and whitelist_custom_nodes
+
+Import times for custom nodes:
+   0.0 seconds: D:\ComfyUI\custom_nodes\shannon-prime-comfyui
+   0.2 seconds: D:\ComfyUI\custom_nodes\ComfyUI-GGUF
+
+Context impl SQLiteImpl.
+Will assume non-transactional DDL.
+Assets scan(roots=['models']) completed in 0.042s (created=0, skipped_existing=138, orphans_pruned=0, total_seen=138)
+Starting server
+
+To see the GUI go to: http://127.0.0.1:8188
+got prompt
+Using pytorch attention in VAE
+Using pytorch attention in VAE
+VAE load device: cuda:0, offload device: cpu, dtype: torch.float16
+gguf qtypes: Q8_0 (169), F32 (73)
+Attempting to recreate sentencepiece tokenizer from GGUF file metadata...
+!!! Exception during processing !!! Please make sure sentencepiece and protobuf are installed.
+pip install sentencepiece protobuf
+Traceback (most recent call last):
+  File "D:\ComfyUI\custom_nodes\ComfyUI-GGUF\loader.py", line 341, in gguf_tokenizer_loader
+    from sentencepiece import sentencepiece_model_pb2 as model
+  File "D:\ComfyUI\.venv\Lib\site-packages\sentencepiece\sentencepiece_model_pb2.py", line 5, in <module>
+    from google.protobuf.internal import builder as _builder
+ModuleNotFoundError: No module named 'google'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "D:\ComfyUI\execution.py", line 524, in execute
+    output_data, output_ui, has_subgraph, has_pending_tasks = await get_output_data(prompt_id, unique_id, obj, input_data_all, execution_block_cb=execution_block_cb, pre_execute_cb=pre_execute_cb, v3_data=v3_data)
+                                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\ComfyUI\execution.py", line 333, in get_output_data
+    return_values = await _async_map_node_over_list(prompt_id, unique_id, obj, input_data_all, obj.FUNCTION, allow_interrupt=True, execution_block_cb=execution_block_cb, pre_execute_cb=pre_execute_cb, v3_data=v3_data)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\ComfyUI\execution.py", line 307, in _async_map_node_over_list
+    await process_inputs(input_dict, i)
+  File "D:\ComfyUI\execution.py", line 295, in process_inputs
+    result = f(**inputs)
+             ^^^^^^^^^^^
+  File "D:\ComfyUI\custom_nodes\ComfyUI-GGUF\nodes.py", line 251, in load_clip
+    return (self.load_patcher([clip_path], clip_type, self.load_data([clip_path])),)
+                                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\ComfyUI\custom_nodes\ComfyUI-GGUF\nodes.py", line 227, in load_data
+    sd = gguf_clip_loader(p)
+         ^^^^^^^^^^^^^^^^^^^
+  File "D:\ComfyUI\custom_nodes\ComfyUI-GGUF\loader.py", line 477, in gguf_clip_loader
+    sd["spiece_model"] = gguf_tokenizer_loader(path, sd[temb_key].shape)
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\ComfyUI\custom_nodes\ComfyUI-GGUF\loader.py", line 343, in gguf_tokenizer_loader
+    raise ImportError("Please make sure sentencepiece and protobuf are installed.\npip install sentencepiece protobuf")
+ImportError: Please make sure sentencepiece and protobuf are installed.
+pip install sentencepiece protobuf
+
+Prompt executed in 11.97 seconds
+got prompt
+gguf qtypes: Q8_0 (169), F32 (73)
+Attempting to recreate sentencepiece tokenizer from GGUF file metadata...
+Created tokenizer with vocab size of 256384
+Dequantizing token_embd.weight to prevent runtime OOM.
+CLIP/text encoder model load device: cuda:0, offload device: cpu, current: cpu, dtype: torch.float16
+Requested to load WanTEModel
+loaded completely; 9773.80 MB usable, 6695.95 MB loaded, full load: True
+gguf qtypes: F16 (524), Q8_0 (300), F32 (1)
+model weight dtype torch.float16, manual cast: None
+model_type FLOW
+Requested to load WAN22
+Unloaded partially: 3035.45 MB freed, 3660.50 MB remains loaded, 297.50 MB buffer reserved, lowvram patches: 0
+loaded completely; 6081.17 MB usable, 5232.90 MB loaded, full load: True
+[Shannon-Prime] patched 30/30 Wan blocks (head_dim=128, K=[5, 4, 4, 3], V=[5, 4, 4, 3], möbius=True, compression~3.56x)
+  0%|          | 0/8 [00:00<?, ?it/s] 12%|#2        | 1/8 [00:01<00:13,  1.96s/it] 25%|##5       | 2/8 [00:03<00:09,  1.66s/it] 38%|###7      | 3/8 [00:04<00:07,  1.57s/it] 50%|#####     | 4/8 [00:06<00:06,  1.52s/it] 62%|######2   | 5/8 [00:07<00:04,  1.50s/it] 75%|#######5  | 6/8 [00:09<00:02,  1.48s/it] 88%|########7 | 7/8 [00:10<00:01,  1.47s/it]100%|##########| 8/8 [00:12<00:00,  1.47s/it]100%|##########| 8/8 [00:12<00:00,  1.52s/it]
+Requested to load WanVAE
+Unloaded partially: 3660.50 MB freed, 0.00 MB remains loaded, 6094.00 MB buffer reserved, lowvram patches: 0
+loaded completely; 2682.65 MB usable, 1344.09 MB loaded, full load: True
+Prompt executed in 70.84 seconds
+got prompt
+  0%|          | 0/8 [00:00<?, ?it/s] 12%|#2        | 1/8 [00:01<00:11,  1.68s/it] 25%|##5       | 2/8 [00:03<00:08,  1.48s/it] 38%|###7      | 3/8 [00:04<00:07,  1.47s/it] 50%|#####     | 4/8 [00:05<00:05,  1.46s/it] 62%|######2   | 5/8 [00:07<00:04,  1.46s/it] 75%|#######5  | 6/8 [00:08<00:02,  1.46s/it] 88%|########7 | 7/8 [00:10<00:01,  1.46s/it]100%|##########| 8/8 [00:11<00:00,  1.46s/it]100%|##########| 8/8 [00:11<00:00,  1.47s/it]
+Prompt executed in 16.20 seconds

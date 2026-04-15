@@ -1,0 +1,5 @@
+Queueing workflows/wan22_ti2v_5b_baseline.json
+Queued prompt_id=5be0acdd-b083-426b-9be4-789dbd6f1adc
+[t=   0s] running=1 pending=0
+Completed in 18.0s
+  node 10 [images]: sp_wan_baseline_00001_.webp

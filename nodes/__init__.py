@@ -2,5 +2,6 @@
 # Copyright (C) 2026 Ray Daniels. All Rights Reserved.
 # Licensed under AGPLv3. Commercial license available.
 
-NODE_CLASS_MAPPINGS = {}
-NODE_DISPLAY_NAME_MAPPINGS = {}
+from .shannon_prime_nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+
+__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

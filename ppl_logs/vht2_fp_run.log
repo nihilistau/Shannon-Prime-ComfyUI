@@ -1,0 +1,5 @@
+Queueing workflows/wan22_ti2v_5b_vht2.json
+Queued prompt_id=05f0d0fb-1f5f-4a3c-8d9c-a25ab7798942
+[t=   0s] running=1 pending=0
+Completed in 66.5s
+  node 10 [images]: sp_wan_vht2_00002_.webp

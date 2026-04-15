@@ -2,8 +2,8 @@ Prestartup Skipping comfyui-easy-use due to disable_all_custom_nodes and whiteli
 Prestartup Skipping comfyui-manager due to disable_all_custom_nodes and whitelist_custom_nodes
 Prestartup Skipping rgthree-comfy due to disable_all_custom_nodes and whitelist_custom_nodes
 WARNING: You need pytorch with cu130 or higher to use optimized CUDA operations.
-Found comfy_kitchen backend cuda: {'available': True, 'disabled': True, 'unavailable_reason': None, 'capabilities': ['apply_rope', 'apply_rope1', 'dequantize_nvfp4', 'dequantize_per_tensor_fp8', 'quantize_mxfp8', 'quantize_nvfp4', 'quantize_per_tensor_fp8', 'scaled_mm_nvfp4']}
 Found comfy_kitchen backend triton: {'available': False, 'disabled': True, 'unavailable_reason': "ImportError: No module named 'triton'", 'capabilities': []}
+Found comfy_kitchen backend cuda: {'available': True, 'disabled': True, 'unavailable_reason': None, 'capabilities': ['apply_rope', 'apply_rope1', 'dequantize_nvfp4', 'dequantize_per_tensor_fp8', 'quantize_mxfp8', 'quantize_nvfp4', 'quantize_per_tensor_fp8', 'scaled_mm_nvfp4']}
 Found comfy_kitchen backend eager: {'available': True, 'disabled': False, 'unavailable_reason': None, 'capabilities': ['apply_rope', 'apply_rope1', 'dequantize_nvfp4', 'dequantize_per_tensor_fp8', 'quantize_nvfp4', 'quantize_per_tensor_fp8', 'scaled_mm_nvfp4']}
 Checkpoint files will always be loaded safely.
 Total VRAM 12288 MB, total RAM 32284 MB
@@ -129,7 +129,7 @@ Import times for custom nodes:
 
 Context impl SQLiteImpl.
 Will assume non-transactional DDL.
-Assets scan(roots=['models']) completed in 0.042s (created=0, skipped_existing=138, orphans_pruned=0, total_seen=138)
+Assets scan(roots=['models']) completed in 0.046s (created=0, skipped_existing=138, orphans_pruned=0, total_seen=138)
 Starting server
 
 To see the GUI go to: http://127.0.0.1:8188
@@ -137,47 +137,6 @@ got prompt
 Using pytorch attention in VAE
 Using pytorch attention in VAE
 VAE load device: cuda:0, offload device: cpu, dtype: torch.float16
-gguf qtypes: Q8_0 (169), F32 (73)
-Attempting to recreate sentencepiece tokenizer from GGUF file metadata...
-!!! Exception during processing !!! Please make sure sentencepiece and protobuf are installed.
-pip install sentencepiece protobuf
-Traceback (most recent call last):
-  File "D:\ComfyUI\custom_nodes\ComfyUI-GGUF\loader.py", line 341, in gguf_tokenizer_loader
-    from sentencepiece import sentencepiece_model_pb2 as model
-  File "D:\ComfyUI\.venv\Lib\site-packages\sentencepiece\sentencepiece_model_pb2.py", line 5, in <module>
-    from google.protobuf.internal import builder as _builder
-ModuleNotFoundError: No module named 'google'
-
-During handling of the above exception, another exception occurred:
-
-Traceback (most recent call last):
-  File "D:\ComfyUI\execution.py", line 524, in execute
-    output_data, output_ui, has_subgraph, has_pending_tasks = await get_output_data(prompt_id, unique_id, obj, input_data_all, execution_block_cb=execution_block_cb, pre_execute_cb=pre_execute_cb, v3_data=v3_data)
-                                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "D:\ComfyUI\execution.py", line 333, in get_output_data
-    return_values = await _async_map_node_over_list(prompt_id, unique_id, obj, input_data_all, obj.FUNCTION, allow_interrupt=True, execution_block_cb=execution_block_cb, pre_execute_cb=pre_execute_cb, v3_data=v3_data)
-                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "D:\ComfyUI\execution.py", line 307, in _async_map_node_over_list
-    await process_inputs(input_dict, i)
-  File "D:\ComfyUI\execution.py", line 295, in process_inputs
-    result = f(**inputs)
-             ^^^^^^^^^^^
-  File "D:\ComfyUI\custom_nodes\ComfyUI-GGUF\nodes.py", line 251, in load_clip
-    return (self.load_patcher([clip_path], clip_type, self.load_data([clip_path])),)
-                                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "D:\ComfyUI\custom_nodes\ComfyUI-GGUF\nodes.py", line 227, in load_data
-    sd = gguf_clip_loader(p)
-         ^^^^^^^^^^^^^^^^^^^
-  File "D:\ComfyUI\custom_nodes\ComfyUI-GGUF\loader.py", line 477, in gguf_clip_loader
-    sd["spiece_model"] = gguf_tokenizer_loader(path, sd[temb_key].shape)
-                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "D:\ComfyUI\custom_nodes\ComfyUI-GGUF\loader.py", line 343, in gguf_tokenizer_loader
-    raise ImportError("Please make sure sentencepiece and protobuf are installed.\npip install sentencepiece protobuf")
-ImportError: Please make sure sentencepiece and protobuf are installed.
-pip install sentencepiece protobuf
-
-Prompt executed in 11.97 seconds
-got prompt
 gguf qtypes: Q8_0 (169), F32 (73)
 Attempting to recreate sentencepiece tokenizer from GGUF file metadata...
 Created tokenizer with vocab size of 256384
@@ -192,11 +151,8 @@ Requested to load WAN22
 Unloaded partially: 3035.45 MB freed, 3660.50 MB remains loaded, 297.50 MB buffer reserved, lowvram patches: 0
 loaded completely; 6081.17 MB usable, 5232.90 MB loaded, full load: True
 [Shannon-Prime] patched 30/30 Wan blocks (head_dim=128, K=[5, 4, 4, 3], V=[5, 4, 4, 3], möbius=True, compression~3.56x)
-  0%|          | 0/8 [00:00<?, ?it/s] 12%|#2        | 1/8 [00:01<00:13,  1.96s/it] 25%|##5       | 2/8 [00:03<00:09,  1.66s/it] 38%|###7      | 3/8 [00:04<00:07,  1.57s/it] 50%|#####     | 4/8 [00:06<00:06,  1.52s/it] 62%|######2   | 5/8 [00:07<00:04,  1.50s/it] 75%|#######5  | 6/8 [00:09<00:02,  1.48s/it] 88%|########7 | 7/8 [00:10<00:01,  1.47s/it]100%|##########| 8/8 [00:12<00:00,  1.47s/it]100%|##########| 8/8 [00:12<00:00,  1.52s/it]
+  0%|          | 0/8 [00:00<?, ?it/s] 12%|#2        | 1/8 [00:01<00:12,  1.83s/it] 25%|##5       | 2/8 [00:03<00:09,  1.56s/it] 38%|###7      | 3/8 [00:04<00:07,  1.48s/it] 50%|#####     | 4/8 [00:05<00:05,  1.44s/it] 62%|######2   | 5/8 [00:07<00:04,  1.42s/it] 75%|#######5  | 6/8 [00:08<00:02,  1.40s/it] 88%|########7 | 7/8 [00:10<00:01,  1.40s/it]100%|##########| 8/8 [00:11<00:00,  1.39s/it]100%|##########| 8/8 [00:11<00:00,  1.44s/it]
 Requested to load WanVAE
 Unloaded partially: 3660.50 MB freed, 0.00 MB remains loaded, 6094.00 MB buffer reserved, lowvram patches: 0
 loaded completely; 2682.65 MB usable, 1344.09 MB loaded, full load: True
-Prompt executed in 70.84 seconds
-got prompt
-  0%|          | 0/8 [00:00<?, ?it/s] 12%|#2        | 1/8 [00:01<00:11,  1.68s/it] 25%|##5       | 2/8 [00:03<00:08,  1.48s/it] 38%|###7      | 3/8 [00:04<00:07,  1.47s/it] 50%|#####     | 4/8 [00:05<00:05,  1.46s/it] 62%|######2   | 5/8 [00:07<00:04,  1.46s/it] 75%|#######5  | 6/8 [00:08<00:02,  1.46s/it] 88%|########7 | 7/8 [00:10<00:01,  1.46s/it]100%|##########| 8/8 [00:11<00:00,  1.46s/it]100%|##########| 8/8 [00:11<00:00,  1.47s/it]
-Prompt executed in 16.20 seconds
+Prompt executed in 66.27 seconds

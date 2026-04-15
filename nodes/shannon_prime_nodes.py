@@ -37,14 +37,46 @@ for p in (_SP_TOOLS, _SP_TORCH):
 from shannon_prime_comfyui import VHT2CrossAttentionCache  # noqa: E402
 
 
+def _input_fingerprint(x: torch.Tensor):
+    """
+    Cheap content-based fingerprint — identifies same-valued inputs even when
+    re-allocated to a new memory address.
+
+    We can't use `data_ptr()` as the identity for cache hits because ComfyUI's
+    sampler re-batches the conditioning tensor into a fresh allocation each
+    timestep. Pointer-identity invalidated the cache every step and the hits
+    documented in the paper never materialised.
+
+    Three flat-index samples + shape + dtype disambiguate "same context across
+    timesteps" vs "fresh context for a new generation" without scanning the
+    full tensor. On CUDA each `.item()` forces a single-element device→host
+    sync; three of those per cross-attn forward is negligible (~10 µs total)
+    compared to the compress/decompress work they save.
+    """
+    flat = x.view(-1) if x.is_contiguous() else x.reshape(-1)
+    n = flat.numel()
+    # Pick three anchors that spread across the tensor; identical data will
+    # fingerprint identically regardless of reallocation.
+    i_mid = n // 2 if n > 1 else 0
+    i_end = n - 1 if n > 0 else 0
+    return (
+        tuple(x.shape),
+        x.dtype,
+        float(flat[0].item()),
+        float(flat[i_mid].item()),
+        float(flat[i_end].item()),
+    )
+
+
 class _SPCachingLinear(nn.Module):
     """
     Drop-in for cross_attn.k / cross_attn.v (and k_img / v_img).
 
-    Caches the linear's output keyed by (key, data_ptr(input)). On input-tensor
-    change (e.g. new generation with a new context tensor), the stored entry
-    is invalidated and refilled. The cached value is VHT2-compressed and
-    reconstructed each read.
+    Caches the linear's output keyed by (key, content_fingerprint(input)).
+    The first call for a given fingerprint computes + compresses; subsequent
+    calls with the same fingerprint reconstruct from the VHT2 cache. When the
+    fingerprint changes (new generation with a different prompt/seed), the
+    stale entry is dropped and refilled on that call.
     """
 
     def __init__(self, original: nn.Module, cache: VHT2CrossAttentionCache, key: str):
@@ -52,30 +84,30 @@ class _SPCachingLinear(nn.Module):
         self.original = original
         self._sp_cache = cache
         self._sp_key = key
-        self._sp_last_ptr = None
+        self._sp_last_fp = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         cache = self._sp_cache
         key = self._sp_key
-        ptr = x.data_ptr()
+        fp = _input_fingerprint(x)
 
-        # If the input is the same memory we saw last time AND we have a cache
-        # entry, return the reconstructed value.
-        if ptr == self._sp_last_ptr and cache.has(key):
+        # Cache hit: the conditioning content fingerprint matches what we
+        # stored last time AND we have an entry. Return the reconstructed K/V.
+        if fp == self._sp_last_fp and cache.has(key):
             out, _ = cache.get(key)
             return out
 
-        # Input changed or no entry — compute fresh.
+        # Fingerprint changed or no entry — recompute and refill.
         result = self.original(x)
 
-        # Drop the stale entry (under the expert-scoped key).
+        # Drop any stale entry under the expert-scoped key.
         stored_key = cache._cache_key(key)
         cache._cache.pop(stored_key, None)
 
-        # Cache it. VHT2CrossAttentionCache.put() stores a (k, v) pair; we use
-        # the same tensor for both since each linear is cached independently.
+        # VHT2CrossAttentionCache.put() stores a (k, v) pair; we use the same
+        # tensor for both since each linear is cached independently.
         cache.put(key, result, result)
-        self._sp_last_ptr = ptr
+        self._sp_last_fp = fp
         return result
 
 

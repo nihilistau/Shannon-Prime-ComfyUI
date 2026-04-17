@@ -9,8 +9,9 @@ a submodule at `lib/shannon-prime/`; never duplicate core code here, import
 it.
 
 The underlying transform is **VHT2** (Vilenkin-Hartley Transform) — the
-single orthonormal staged Hartley transform that reduces to the WHT butterfly
-at p=2 and extends to primes {2,3,5,7,11} at sqfree-padded dims. Both the
+single orthonormal staged Hartley transform that reduces to the classical
+Walsh-Hadamard butterfly at n=2^k and extends to primes {2,3,5,7,11} at
+sqfree-padded dims. Both the
 ship cache (`ShannonPrimeWanCache`) and the aggressive sqfree+spinor variant
 (`ShannonPrimeWanCacheSqfree`) use it.
 

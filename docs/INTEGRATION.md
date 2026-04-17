@@ -162,7 +162,7 @@ Widgets on the `ShannonPrimeWanCache` node:
 
 | Widget | Default | Description |
 |---|---|---|
-| `k_bits` | `5,4,4,3` | K band bit allocation. 4 bands. Unlike self-attention's 5/5/4/3 (which matches K's WHT energy decay from RoPE), cross-attn K has no RoPE so all four bands carry similar energy — 5/4/4/3 is a reasonable flat-ish allocation. |
+| `k_bits` | `5,4,4,3` | K band bit allocation. 4 bands. Unlike self-attention's 5/5/4/3 (which matches K's VHT2 energy decay from RoPE), cross-attn K has no RoPE so all four bands carry similar energy — 5/4/4/3 is a reasonable flat-ish allocation. |
 | `v_bits` | `5,4,4,3` | V band bit allocation. Same rationale as K. In self-attention V gets flat 3-bit (1 band); in cross-attention both K and V are spectrally similar so they share the 4-band scheme. |
 | `use_mobius` | `True` | Möbius squarefree-first reordering. Applied to both K and V (unlike self-attention where only K gets Möbius). |
 

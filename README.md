@@ -2,11 +2,21 @@
 
 **Shannon-Prime VHT2 cross-attention caching for ComfyUI video generation**
 
-Compresses and caches cross-attention K/V in Wan 2.1/2.2 video generation models.
-Cross-attention from T5 text embeddings is identical across all diffusion timesteps —
-compute once, compress via VHT2, reconstruct on subsequent calls.
+Compresses and caches cross-attention K/V in Wan 2.1/2.2 video generation
+models. Cross-attention from T5/UMT5 text embeddings is identical across all
+diffusion timesteps — compute once, compress via the VHT2 spectral transform,
+reconstruct on subsequent calls. Two node variants use the same underlying
+transform:
 
-Production results (Wan 2.2 14B, RTX 2060): 1.20× cross-attention speedup, 0.9984 output correlation.
+- **`ShannonPrimeWanCache`** (ship path): VHT2 + Möbius reorder + 4-band
+  quantization. Drop-in, well-tested.
+- **`ShannonPrimeWanCacheSqfree`** (aggressive, opt-in): sqfree-padded VHT2
+  + Knight mask + Möbius CSR predictor + 3-bit residual + SU(2) spinor sheet
+  bit. Targets Q8+ backbones; wraps `VHT2SqfreeCrossAttentionCache` from the
+  submodule.
+
+Production results (Wan 2.2 14B, RTX 2060): 1.20× cross-attention speedup,
+0.9984 output correlation on the ship path.
 
 ## Supported Models
 
@@ -20,15 +30,28 @@ Production results (Wan 2.2 14B, RTX 2060): 1.20× cross-attention speedup, 0.99
 ## Installation
 
 ```bash
-# Clone into ComfyUI custom nodes
+# Option A — install into an existing ComfyUI
 cd /path/to/ComfyUI/custom_nodes
-git clone --recursive https://github.com/YOUR_USER/shannon-prime-comfyui.git
+git clone --recursive https://github.com/nihilistau/shannon-prime-comfyui.git
+
+# Option B — point a ComfyUI install at this repo via a junction / symlink
+mklink /J /path/to/ComfyUI/custom_nodes/shannon-prime-comfyui \
+    /path/to/shannon-prime-comfyui
 ```
 
 ## Usage
 
-Load the example workflows from `workflows/` or use the wrapper directly:
+### Ship workflow
+```bash
+python scripts/run_workflow.py workflows/wan22_ti2v_5b_vht2.json
+```
 
+### Sqfree+spinor workflow (aggressive, Q8+)
+```bash
+python scripts/run_workflow.py workflows/wan22_ti2v_5b_sqfree.json
+```
+
+### Programmatic use (ship wrapper)
 ```python
 from shannon_prime_comfyui import WanVHT2Wrapper
 
@@ -45,8 +68,27 @@ for step, sigma in enumerate(sigmas):
 wrapper.reset()  # Between generations
 ```
 
-See [docs/INTEGRATION.md](docs/INTEGRATION.md) for the full guide with Wan architecture diagrams.
+## Node Parameters
+
+### `ShannonPrimeWanCache` (ship)
+| Input | Default | Description |
+|-------|---------|-------------|
+| `k_bits` | `"5,4,4,3"` | K band bit allocation (4 bands) |
+| `v_bits` | `"5,4,4,3"` | V band bit allocation — banded for cross-attn, no RoPE asymmetry |
+| `use_mobius` | `True` | Möbius squarefree-first reorder on both K and V |
+
+### `ShannonPrimeWanCacheSqfree` (aggressive)
+| Input | Default | Description |
+|-------|---------|-------------|
+| `band_bits` | `"3,3,3,3,3"` | 5-band torus-aligned allocation over the sqfree-padded skeleton |
+| `residual_bits` | `3` | N-bit residual quantization (1–4; 3 is the Pareto point) |
+| `use_spinor` | `True` | SU(2) sheet-bit correction at the causal-mask boundary |
+
+See [docs/INTEGRATION.md](docs/INTEGRATION.md) for architecture diagrams and
+Wan-specific details.
 
 ## License
 
 AGPLv3 / Commercial dual license. See [LICENSE](LICENSE).
+
+Copyright (C) 2026 Ray Daniels.

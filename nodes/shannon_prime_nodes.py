@@ -276,11 +276,98 @@ class ShannonPrimeWanCacheStats:
         return (model,)
 
 
+class ShannonPrimeWanCacheSqfree:
+    """
+    Aggressive variant of ShannonPrimeWanCache using the sqfree+spinor path.
+
+    Wraps Wan cross-attn K/V with the sqfree prime-Hartley basis + Möbius CSR
+    predictor + (optional) SU(2) spinor sheet-bit correction. Target regime:
+    Q8+ text encoders + bf16 diffusion weights (per CLAUDE.md scaling law).
+    Uses `VHT2SqfreeCrossAttentionCache` + `WanSqfreeCrossAttnCachingLinear`
+    from the submodule's sqfree tool — these expose a get_or_compute API
+    rather than the put/get used by the WHT cache, so cannot be dropped into
+    the WHT node without a second wrapper class.
+    """
+
+    CATEGORY = "shannon-prime"
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "patch"
+    DESCRIPTION = ("Sqfree+spinor aggressive variant of the Wan cross-attention cache. "
+                   "Higher compression at equivalent quality on Q8+ backbones.")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "band_bits": ("STRING", {"default": "3,3,3,3,3",
+                                         "tooltip": "5-band torus-aligned bit allocation (default aggressive 3/3/3/3/3)"}),
+                "residual_bits": ("INT", {"default": 3, "min": 1, "max": 4,
+                                          "tooltip": "N-bit residual quantization. 3 is the Shannon saturation point."}),
+                "use_spinor": ("BOOLEAN", {"default": True,
+                                           "tooltip": "Enable SU(2) spinor sheet-bit correction at the causal-mask boundary"}),
+            },
+        }
+
+    @classmethod
+    def IS_CHANGED(cls, *args, **kwargs):
+        return float("nan")
+
+    def patch(self, model, band_bits: str, residual_bits: int, use_spinor: bool):
+        band_bits_list = _parse_bits_csv(band_bits, [3, 3, 3, 3, 3], 5)
+
+        from shannon_prime_comfyui_sqfree import (  # local import: only needed for sqfree path
+            VHT2SqfreeCrossAttentionCache,
+            WanSqfreeCrossAttnCachingLinear,
+        )
+
+        patched = model.clone()
+        blocks = list(_iter_wan_blocks(patched))
+        if not blocks:
+            print("[Shannon-Prime SQFREE] no Wan blocks found on model — passing through")
+            return (patched,)
+
+        head_dim = blocks[0][1].self_attn.head_dim
+        max_blocks = len(blocks)
+
+        cache = VHT2SqfreeCrossAttentionCache(
+            head_dim=head_dim,
+            max_blocks=max_blocks,
+            use_spinor=bool(use_spinor),
+            residual_bits=int(residual_bits),
+            band_bits=band_bits_list,
+        )
+
+        wrapped = 0
+        for i, blk in blocks:
+            cross_attn = getattr(blk, "cross_attn", None)
+            if cross_attn is None:
+                continue
+            for suffix, attr in (("k", "k"), ("v", "v"), ("kimg", "k_img"), ("vimg", "v_img")):
+                lin = getattr(cross_attn, attr, None)
+                if lin is None or isinstance(lin, WanSqfreeCrossAttnCachingLinear):
+                    continue
+                wrapper = WanSqfreeCrossAttnCachingLinear(lin, cache, f"block_{i}_{suffix}")
+                setattr(cross_attn, attr, wrapper)
+            wrapped += 1
+
+        patched._sp_sqfree_cache = cache
+        pad_dim = cache._cache.pad_dim  # internal, but useful for the log
+
+        print(f"[Shannon-Prime SQFREE] patched {wrapped}/{len(blocks)} Wan blocks "
+              f"(head_dim={head_dim} -> pad_dim={pad_dim}, bands={band_bits_list}, "
+              f"residual_bits={residual_bits}, spinor={use_spinor})")
+
+        return (patched,)
+
+
 NODE_CLASS_MAPPINGS = {
     "ShannonPrimeWanCache": ShannonPrimeWanCache,
     "ShannonPrimeWanCacheStats": ShannonPrimeWanCacheStats,
+    "ShannonPrimeWanCacheSqfree": ShannonPrimeWanCacheSqfree,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ShannonPrimeWanCache": "Shannon-Prime Wan Cache",
     "ShannonPrimeWanCacheStats": "Shannon-Prime Wan Cache Stats",
+    "ShannonPrimeWanCacheSqfree": "Shannon-Prime Wan Cache (Sqfree+Spinor)",
 }

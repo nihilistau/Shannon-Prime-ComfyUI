@@ -73,8 +73,8 @@ wrapper.reset()  # Between generations
 ### `ShannonPrimeWanCache` (ship)
 | Input | Default | Description |
 |-------|---------|-------------|
-| `k_bits` | `"5,4,4,3"` | K band bit allocation (4 bands) |
-| `v_bits` | `"5,4,4,3"` | V band bit allocation — banded for cross-attn, no RoPE asymmetry |
+| `k_bits` | `"5,4,4,3"` | K band bit allocation (4 bands). Cross-attn-specific — the parent engine's self-attn default is `5,5,4,3` because RoPE concentrates the first K band; here there's no RoPE on the cross-attn K, so K and V ship with matching symmetric profiles. |
+| `v_bits` | `"5,4,4,3"` | V band bit allocation — banded for cross-attn (self-attn uses flat-3 instead). |
 | `use_mobius` | `True` | Möbius squarefree-first reorder on both K and V |
 
 ### `ShannonPrimeWanCacheSqfree` (aggressive)

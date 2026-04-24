@@ -930,12 +930,16 @@ class ShannonPrimeWanBlockSkip:
         # Shared state across all patched blocks
         state = {
             'global_step':    [0],      # step counter (incremented by block-0)
+            'last_gen_step':  [0],      # detect new generation (step reset)
             'hit_streak':     {},       # block_idx -> consecutive cache-hit count
-            'attn_cache':     {},       # block_idx -> y tensor (CPU)
+            'attn_cache':     {},       # block_idx -> y tensor (CPU, cleared between gens)
             'step_cached':    {},       # block_idx -> step at which y was cached
             'rolling_sim':    {},       # block_idx -> float (recent cos_sim)
             'effective_win':  {},       # block_idx -> current effective window
-            'x_ref':      {},   # block_idx -> x tensor at last cache miss (CPU)
+            # x_norm: lightweight proxy for x_drift (per-token norm, not full tensor).
+            # Replaces full x_ref (66MB/block at 720p → was 594MB total held during VAE).
+            # Shape: (n_tokens,) float32 = ~43KB/block vs 66MB — eliminates the VAE slowdown.
+            'x_norm':     {},   # block_idx -> per-token L2 norm of x (CPU, tiny)
             # Per-tier x_drift thresholds (0.0 = disabled)
             'x_drift_t0': x_drift_t0,   # Tier-0 (L00-L03): default disabled
             'x_drift_t1': x_drift_t1,   # Tier-1 (L04-L08): default 0.25
@@ -951,14 +955,16 @@ class ShannonPrimeWanBlockSkip:
             n   = (a_f.norm() * b_f.norm()).clamp(min=1e-10)
             return float((a_f * b_f).sum() / n)
 
-        def _x_rel_drift(x_cur, x_ref_cpu):
-            """Relative L2 drift of block input x vs stored reference.
-            Cheap: single norm computation over flattened tensor.
-            Returns float in [0, 2]. 0=identical, ~1.4=orthogonal."""
-            x_ref = x_ref_cpu.to(device=x_cur.device, dtype=x_cur.dtype)
-            diff  = x_cur.float() - x_ref.float()
-            ref_n = x_ref.float().norm().clamp(min=1e-10)
-            return float(diff.norm() / ref_n)
+        def _x_norm_drift(x_cur, x_norm_cpu):
+            """Lightweight x-drift check using per-token norm comparison.
+            Stores only ||x||_token (shape n_tokens, ~43KB) instead of full x (66MB).
+            Compares mean fractional change in token norms across the sequence.
+            Returns float >= 0. 0=identical, >0.30=significant structural change."""
+            cur_norm = x_cur.float().norm(dim=-1).squeeze()   # (n_tokens,) on GPU
+            ref_norm = x_norm_cpu.to(cur_norm.device)         # tiny, fast transfer
+            ref_mean = ref_norm.mean().clamp(min=1e-10)
+            drift    = (cur_norm - ref_norm).abs().mean()
+            return float(drift / ref_mean)
 
         def make_patched_forward(orig_forward, block_idx, blk):
             window = get_window(block_idx)
@@ -966,10 +972,26 @@ class ShannonPrimeWanBlockSkip:
             def patched_forward(x, e, freqs, context,
                                 context_img_len=257,
                                 transformer_options={}):
-                # ── Step counter ────────────────────────────────────────────
+                # ── Step counter + new-generation detection ──────────────────
                 if block_idx == 0:
                     state['global_step'][0] += 1
                 step = state['global_step'][0]
+
+                # Detect new generation: step jumped back or reset.
+                # Clear all cached tensors so they don't eat memory during VAE decode.
+                last = state['last_gen_step'][0]
+                if block_idx == 0 and last > 0 and step <= 2 and last > 5:
+                    if verbose:
+                        print(f"[SP BlockSkip] New generation detected — clearing cache")
+                    state['attn_cache'].clear()
+                    state['step_cached'].clear()
+                    state['x_norm'].clear()
+                    state['rolling_sim'].clear()
+                    state['hit_streak'].clear()
+                    for i in state['effective_win']:
+                        state['effective_win'][i] = get_window(i)
+                if block_idx == 0:
+                    state['last_gen_step'][0] = step
 
                 # ── Recompute adaLN modulation (always — cheap) ─────────────
                 cast = comfy.model_management.cast_to
@@ -993,9 +1015,9 @@ class ShannonPrimeWanBlockSkip:
                 x_drift_forced_miss = False
                 x_drift_thr = state['x_drift_t0'] if block_idx < 4 else state['x_drift_t1']
                 if (x_drift_thr > 0.0 and eff_win > 0 and age > 0
-                        and block_idx in state['x_ref']
+                        and block_idx in state['x_norm']
                         and block_idx in state['attn_cache']):
-                    x_dr = _x_rel_drift(x, state['x_ref'][block_idx])
+                    x_dr = _x_norm_drift(x, state['x_norm'][block_idx])
                     if x_dr > x_drift_thr:
                         x_drift_forced_miss = True
                         state['effective_win'][block_idx] = max(1, eff_win // 2)
@@ -1065,13 +1087,13 @@ class ShannonPrimeWanBlockSkip:
                                   f"roll={state['rolling_sim'][block_idx]:.3f} "
                                   f"win={state['effective_win'][block_idx]}")
 
-                    # Always store on CPU. ComfyUI uses async weight offloading streams
-                    # that consume GPU memory dynamically. GPU y-cache competes with
-                    # these streams → legacy ModelPatcher offloads model weights →
-                    # VRAM death spiral at 720p+ (3s→40s/it observed).
-                    # CPU PCIe cost (~4ms per hit at 720p) is far cheaper than offloading.
-                    state['attn_cache'][block_idx]   = y.detach().cpu()
-                    state['x_ref'][block_idx]        = x.detach().cpu()
+                    # Store y on CPU. GPU y-cache competed with ComfyUI's memory
+                    # management and caused VRAM death spirals at 720p+ (3s->40s/it).
+                    state['attn_cache'][block_idx]  = y.detach().cpu()
+                    # Store ONLY per-token norms of x (not full x tensor).
+                    # Full x at 720p = 66MB per block = 594MB total held across VAE decode.
+                    # Per-token norm = 43KB per block. Eliminates the 142-second VAE penalty.
+                    state['x_norm'][block_idx]       = x.float().norm(dim=-1).squeeze().cpu()
                     state['step_cached'][block_idx]  = step
                     state['hit_streak'][block_idx]   = 0   # reset on miss
 

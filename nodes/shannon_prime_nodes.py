@@ -931,6 +931,7 @@ class ShannonPrimeWanBlockSkip:
         state = {
             'global_step':    [0],      # step counter (incremented by block-0)
             'last_gen_step':  [0],      # detect new generation (step reset)
+            'last_e_mag':     [None],   # timestep-embedding magnitude at last block-0 call
             'hit_streak':     {},       # block_idx -> consecutive cache-hit count
             'attn_cache':     {},       # block_idx -> y tensor (CPU, cleared between gens)
             'step_cached':    {},       # block_idx -> step at which y was cached
@@ -977,27 +978,41 @@ class ShannonPrimeWanBlockSkip:
                     state['global_step'][0] += 1
                 step = state['global_step'][0]
 
-                # Detect new generation: any y in the cache has step_cached > current step
-                # (negative age) or the step jumped back to <=2.
-                # The age >= 0 check in the hit condition already prevents stale hits,
-                # but we also purge to free memory at generation boundaries.
-                last = state['last_gen_step'][0]
-                # Fire if: a significant fraction of cached blocks have negative age
-                stale_blocks = sum(1 for b, s in state['step_cached'].items()
-                                   if state['global_step'][0] - s < 0)
-                new_gen = (block_idx == 0 and last > 0
-                           and (stale_blocks > 0 or (step <= 2 and last > 5)))
-                if new_gen:
-                    if verbose:
-                        print(f"[SP BlockSkip] New generation detected (stale={stale_blocks}) — clearing cache")
-                    state['attn_cache'].clear()
-                    state['step_cached'].clear()
-                    state['x_norm'].clear()
-                    state['rolling_sim'].clear()
-                    state['hit_streak'].clear()
-                    for i in state['effective_win']:
-                        state['effective_win'][i] = get_window(i)
+                # ── Generation detection via timestep-embedding magnitude ──────
+                # During denoising, sigma decreases → e magnitude decreases.
+                # A new generation jumps sigma back to max → e magnitude spikes up.
+                # Detects generation boundaries even when model is shared across
+                # ComfyUI workflows (patched_forward persists on the shared nn.Module).
                 if block_idx == 0:
+                    e_flat  = e.float().reshape(-1)
+                    e_mag   = float(e_flat.abs().mean())
+                    last_em = state['last_e_mag'][0]
+
+                    is_new_gen = False
+                    if last_em is not None and last_em > 1e-6:
+                        # Sigma jumped upward by >2x → new generation
+                        if e_mag > last_em * 2.0:
+                            is_new_gen = True
+                    # Also catch step-counter anomalies (legacy detection)
+                    last = state['last_gen_step'][0]
+                    stale = sum(1 for b, s in state['step_cached'].items()
+                                if state['global_step'][0] - s < 0)
+                    if stale > 0 or (step <= 2 and last > 5):
+                        is_new_gen = True
+
+                    if is_new_gen:
+                        if verbose:
+                            print(f"[SP BlockSkip] New generation (e_mag {last_em:.3f}->{e_mag:.3f}) "
+                                  f"— clearing cache")
+                        state['attn_cache'].clear()
+                        state['step_cached'].clear()
+                        state['x_norm'].clear()
+                        state['rolling_sim'].clear()
+                        state['hit_streak'].clear()
+                        for i in state['effective_win']:
+                            state['effective_win'][i] = get_window(i)
+
+                    state['last_e_mag'][0]   = e_mag
                     state['last_gen_step'][0] = step
 
                 # ── Recompute adaLN modulation (always — cheap) ─────────────

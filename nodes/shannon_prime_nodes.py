@@ -742,41 +742,11 @@ class ShannonPrimeWanBlockSkip:
             "required": {"model": ("MODEL",)},
             "optional": {
                 "tier_0_window": ("INT",   {"default": 10, "min": 0, "max": 30,
-                    "tooltip": "Cache window for L00-L03 (Permanent Granite)"}),
+                    "tooltip": "Cache window for L00-L03 (Permanent Granite). 0=disabled."}),
                 "tier_1_window": ("INT",   {"default": 3,  "min": 0, "max": 15,
-                    "tooltip": "Cache window for L04-L08 (Stable Sand)"}),
-                "drift_threshold": ("FLOAT", {"default": 0.85, "min": 0.50, "max": 0.99,
-                    "step": 0.01,
-                    "tooltip": "Rolling cos_sim below this halves the cache window (Mertens Oracle)"}),
-                "x_drift_t0": ("FLOAT", {"default": 0.30, "min": 0.0, "max": 1.0,
-                    "step": 0.05,
-                    "tooltip": (
-                        "x-drift threshold for Tier-0 blocks (L00-L03). "
-                        "0.30 catches 'floor drop' events (sudden latent jumps) "
-                        "without over-triggering on normal per-step variation (0.10-0.25). "
-                        "Combine with streak-miss (every 5 hits) for warp-free output. "
-                        "0.0 = disabled (fast but risks composition warping on some prompts)."
-                    )}),
-                "x_drift_t1": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0,
-                    "step": 0.05,
-                    "tooltip": (
-                        "x-drift threshold for Tier-1 blocks (L04-L08, Stable Sand). "
-                        "0.25 matches Wan's per-step latent change envelope. "
-                        "Lower = tighter (more recomputes), higher = more aggressive caching."
-                    )}),
-                "vht2_compress": ("BOOLEAN", {"default": False,
-                    "tooltip": (
-                        "Compress cached y with VHT2 spectral transform + banded quantization. "
-                        "~3.5x memory reduction but significant compute overhead at Wan scale. "
-                        "Default OFF: hierarchical GPU/CPU tiering is faster and lossless."
-                    )}),
-                "verbose": ("BOOLEAN", {"default": False}),
-                "dump_y_npz": ("BOOLEAN", {"default": False,
-                    "tooltip": (
-                        "Dump self-attn y tensors to .npz for spectral analysis. "
-                        "Saves per-step y on first miss per block per generation. "
-                        "Use with SVI hi+lo to compare spectral profiles."
-                    )}),
+                    "tooltip": "Cache window for L04-L08 (Stable Sand). 0=disabled."}),
+                "verbose": ("BOOLEAN", {"default": False,
+                    "tooltip": "Print per-block HIT/MISS logs to console"}),
             },
         }
 
@@ -785,10 +755,7 @@ class ShannonPrimeWanBlockSkip:
         return float("nan")
 
     def patch(self, model, tier_0_window=10, tier_1_window=3,
-              drift_threshold=0.85,
-              x_drift_t0=0.30, x_drift_t1=0.25,
-              vht2_compress=True,
-              verbose=False, dump_y_npz=False):
+              verbose=False, **_ignored):
         import types
         import comfy.model_management
 
@@ -811,11 +778,7 @@ class ShannonPrimeWanBlockSkip:
             return (patched,)
 
         # ── Clear stale caches from previous runs ──────────────────────────────
-        # patch() is called exactly once at the START of every ComfyUI prompt
-        # execution (via model.clone()). Clearing here is guaranteed, unconditional,
-        # and requires zero runtime heuristics — no wall-clock thresholds, no sigma
-        # comparisons. This replaces all generation-boundary detection as the primary
-        # mechanism for preventing stale y from bleeding across generations.
+        # patch() is called at the START of every ComfyUI prompt execution.
         _cleared = 0
         for _i, _blk in blocks:
             _fwd = getattr(_blk, "forward", None)
@@ -826,17 +789,12 @@ class ShannonPrimeWanBlockSkip:
                         if isinstance(_obj, dict) and "attn_cache" in _obj:
                             _obj["attn_cache"].clear()
                             _obj.get("step_cached", {}).clear()
-                            _obj.get("x_norm", {}).clear()
-                            _obj.get("rolling_sim", {}).clear()
                             _obj.get("hit_streak", {}).clear()
-                            _cleared += 1
-                        elif isinstance(_obj, VHT2BlockSkipCache):
-                            _obj.clear()
                             _cleared += 1
                     except ValueError:
                         pass
         if _cleared:
-            print(f"[SP BlockSkip] cleared {_cleared} stale block-cache(s) from previous run")
+            print(f"[SP BlockSkip] cleared {_cleared} stale cache(s) from previous run")
 
         n_blocks = len(blocks)
 
@@ -848,197 +806,40 @@ class ShannonPrimeWanBlockSkip:
                 return tier_1_window
             return 0
 
-        # Adaptive streak limit — computed per-block per-step from rolling_sim.
-        # See the streak_forced_miss block below for the full tiered logic.
-        # (max_streak is no longer a fixed constant; it adapts to oracle confidence)
-
-        # ── VHT2 compressed block cache (optional, default ON) ───────────
-        # When vht2_compress=True, y tensors are stored as VHT2 spectral
-        # coefficients with banded quantization (~3.5x compression).
-        # When False, raw y tensors are stored on CPU (original behavior).
-        vht2_cache = None
-        if vht2_compress:
-            try:
-                # head_dim=128 for all Wan models (5120/40=128, 1536/12=128, 3072/24=128)
-                vht2_cache = VHT2BlockSkipCache(head_dim=128,
-                                                 band_bits=[4, 4, 3, 3],
-                                                 use_mobius=True)
-            except Exception as _e:
-                print(f"[SP BlockSkip] VHT2 cache init failed ({_e}) — falling back to raw storage")
-                vht2_cache = None
-
-        # Shared state across all patched blocks
+        # Shared state across all patched blocks — lean Phase 15
+        # No oracle, no x_drift, no rolling_sim, no runtime gen detection.
+        # Fixed windows from Phase 12 data. All caches CPU/fp16.
         state = {
             'global_step':    [0],      # step counter (incremented by block-0)
-            'last_gen_step':  [0],      # detect new generation (step reset)
-            'last_e_mag':     [None],   # timestep-embedding magnitude at last block-0 call
-            'last_block0_t':  [0.0],    # wall-clock time of last block-0 call (generation detector)
-            'step_duration':  [0.0],    # observed wall-clock per-step (adaptive t_gap baseline)
             'hit_streak':     {},       # block_idx -> consecutive cache-hit count
-            'attn_cache':     {},       # block_idx -> y tensor (CPU) or VHT2BlockSkipCache
+            'attn_cache':     {},       # block_idx -> y tensor (CPU fp16)
             'step_cached':    {},       # block_idx -> step at which y was cached
-            'rolling_sim':    {},       # block_idx -> float (recent cos_sim)
-            'effective_win':  {},       # block_idx -> current effective window
-            # x_norm: lightweight proxy for x_drift (per-token norm, not full tensor).
-            # Replaces full x_ref (66MB/block at 720p → was 594MB total held during VAE).
-            # Shape: (n_tokens,) float32 = ~43KB/block vs 66MB — eliminates the VAE slowdown.
-            'x_norm':     {},   # block_idx -> per-token L2 norm of x (CPU, tiny)
-            # Per-tier x_drift thresholds (0.0 = disabled)
-            'x_drift_t0': x_drift_t0,   # Tier-0 (L00-L03): default disabled
-            'x_drift_t1': x_drift_t1,   # Tier-1 (L04-L08): default 0.25
-            # Y-tensor dump for spectral analysis (dump_y_npz=True)
-            'dump_y': dump_y_npz,
-            'dump_y_data': {},   # block_idx -> list of (step, y_cpu) tuples
-            'dump_y_gen': [0],   # generation counter for file naming
         }
-        for i, _ in blocks:
-            w = get_window(i)
-            state['effective_win'][i] = w
-            state['rolling_sim'][i]   = 1.0
-
-        def _cos_sim(a, b):
-            # Single fused GPU pass, one scalar device→host sync at the end.
-            # torch.no_grad avoids autograd overhead on the norm/dot ops.
-            with torch.no_grad():
-                a_f = a.float().reshape(-1)
-                b_f = b.float().reshape(-1)
-                dot = (a_f * b_f).sum()
-                n   = (a_f.norm() * b_f.norm()).clamp_(min=1e-10)
-                return (dot / n).item()   # single sync point
-
-        def _x_norm_drift(x_cur, x_norm_cpu):
-            """Lightweight x-drift check using per-token norm comparison.
-            Stores only ||x||_token (shape n_tokens, ~43KB) instead of full x (66MB).
-            Compares mean fractional change in token norms across the sequence.
-            Returns float >= 0. 0=identical, >0.30=significant structural change."""
-            cur_norm = x_cur.float().norm(dim=-1).squeeze()   # (n_tokens,) on GPU
-            ref_norm = x_norm_cpu.to(cur_norm.device)         # tiny, fast transfer
-            ref_mean = ref_norm.mean().clamp(min=1e-10)
-            drift    = (cur_norm - ref_norm).abs().mean()
-            return float(drift / ref_mean)
-
-        def _flush_y_dump(st):
-            """Save accumulated y-tensor data to npz and clear."""
-            import numpy as _np
-            gen = st['dump_y_gen'][0]
-            st['dump_y_gen'][0] = gen + 1
-            out_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)),
-                                   "lib", "shannon-prime", "logs", "phase12")
-            os.makedirs(out_dir, exist_ok=True)
-            out_path = os.path.join(out_dir, f"wan_blockskip_y_gen{gen}.npz")
-            # Build arrays: y_data[block_idx] = (step, y_numpy)
-            blocks_dump = sorted(st['dump_y_data'].keys())
-            save_dict = {'block_indices': _np.array(blocks_dump)}
-            for bidx in blocks_dump:
-                step_num, y_np = st['dump_y_data'][bidx]
-                save_dict[f'y_block{bidx}'] = y_np
-                save_dict[f'step_block{bidx}'] = _np.array([step_num])
-            _np.savez_compressed(out_path, **save_dict)
-            n_blocks = len(blocks_dump)
-            shapes = [st['dump_y_data'][b][1].shape for b in blocks_dump[:3]]
-            print(f"[SP BlockSkip] DUMP saved {n_blocks} blocks to {out_path} "
-                  f"(shapes: {shapes}...)")
-            st['dump_y_data'].clear()
 
         def make_patched_forward(orig_forward, block_idx, blk):
             window = get_window(block_idx)
+            # Fixed streak limit: force a miss every N hits to refresh cache.
+            # Phase 12 data: tier-0 sim>0.95, tier-1 sim>0.90 — safe to trust.
+            _streak_limit = 10 if block_idx < 4 else 5
 
             def patched_forward(x, e, freqs, context,
                                 context_img_len=257,
                                 transformer_options={}):
-                # ── Step counter + new-generation detection ──────────────────
+                # ── Step counter ────────────────────────────────────────────
                 if block_idx == 0:
                     state['global_step'][0] += 1
                 step = state['global_step'][0]
 
-                # ── Generation detection (block-0 only) ──────────────────────
-                # Three independent signals — any one clears the cache:
-                #
-                # 1. WALL-CLOCK GAP > 5s between consecutive block-0 calls.
-                #    Denoising steps take ~3s each. Between generations the gap
-                #    is 50-100s (VAE decode + model reload). Guaranteed to work
-                #    regardless of model internals or sigma schedule direction.
-                #    THIS IS THE PRIMARY DETECTOR.
-                #
-                # 2. E-magnitude jump ×2 (sigma returned to high value).
-                #
-                # 3. Legacy: stale step_cached or step-counter anomaly.
-                if block_idx == 0:
-                    import time as _time
-                    now     = _time.time()
-                    t_gap   = now - state['last_block0_t'][0]
-                    e_flat  = e.float().reshape(-1)
-                    e_mag   = float(e_flat.abs().mean())
-                    last_em = state['last_e_mag'][0]
-                    last    = state['last_gen_step'][0]
-                    stale   = sum(1 for b, s in state['step_cached'].items()
-                                  if state['global_step'][0] - s < 0)
+                # Generation boundary: handled by patch() clearing at prompt
+                # start. NO runtime detection — SVI distilled schedules have
+                # non-monotonic sigma, so e_mag increase != new generation.
+                # Caches persist within a prompt (across batch outputs) which
+                # is fine: Phase 12 data shows sim>0.95 for tier-0 blocks.
 
-                    is_new_gen = False
-                    gap_reason = ""
-                    # PRIMARY: e-magnitude monotonicity.
-                    # Within any single Wan generation the timestep embedding
-                    # magnitude (e_mag) is strictly decreasing with sigma. A
-                    # large increase means sigma has reset → new generation.
-                    # Use 50% increase threshold: in SVI 6-step schedules,
-                    # e_mag can fluctuate ±5-10% between adjacent steps within
-                    # the same pass, but a true sigma reset jumps ~2-5×.
-                    # Previous 2% threshold caused false positives every step.
-                    if last_em is not None and last_em > 1e-6 and e_mag > last_em * 1.50:
-                        is_new_gen = True
-                        gap_reason = f"e-increase({last_em:.3f}->{e_mag:.3f})"
-                    # SECONDARY: adaptive wall-clock gap — catches the very
-                    # first run after a long idle (where last_em is None).
-                    # Threshold is max(5× observed step duration, 300s) so it
-                    # works on slow cards (2060: ~85s/step) without false
-                    # positives. 5× gives ample margin: back-to-back steps
-                    # have t_gap ≈ 1× step_duration; between generations the
-                    # gap includes VAE decode + model reload + user idle time.
-                    step_dur = state['step_duration'][0]
-                    gap_thresh = max(step_dur * 5.0, 300.0) if step_dur > 0 else 300.0
-                    if state['last_block0_t'][0] > 0 and t_gap > gap_thresh:
-                        is_new_gen = True
-                        gap_reason += f" t_gap={t_gap:.1f}s>{gap_thresh:.0f}s"
-                    # TERTIARY: step-counter anomalies
-                    if stale > 0 or (step <= 2 and last > 5):
-                        is_new_gen = True
-                        gap_reason += f" stale={stale}"
-
-                    # Track observed step duration for adaptive threshold
-                    if state['last_block0_t'][0] > 0 and not is_new_gen:
-                        # Exponential moving average of step duration
-                        if step_dur > 0:
-                            state['step_duration'][0] = step_dur * 0.7 + t_gap * 0.3
-                        else:
-                            state['step_duration'][0] = t_gap
-
-                    if is_new_gen:
-                        if verbose:
-                            print(f"[SP BlockSkip] New generation [{gap_reason}] — clearing cache")
-
-                        # ── Flush y-tensor dump if active ──────────────────────
-                        if state['dump_y'] and state['dump_y_data']:
-                            _flush_y_dump(state)
-
-                        state['attn_cache'].clear()
-                        if vht2_cache is not None:
-                            vht2_cache.clear()
-                        state['step_cached'].clear()
-                        state['x_norm'].clear()
-                        state['rolling_sim'].clear()
-                        state['hit_streak'].clear()
-                        for i in state['effective_win']:
-                            state['effective_win'][i] = get_window(i)
-
-                    state['last_block0_t'][0] = now
-                    state['last_e_mag'][0]    = e_mag
-                    state['last_gen_step'][0] = step
-
-                # ── Print actual run settings on step 1 (what's really running) ──
+                # ── Print run info on step 1 ────────────────────────────────
                 if block_idx == 0 and step == 1:
-                    _t = x.shape[1]   # total latent tokens
                     print(f"[SP BlockSkip] step=1 x.shape={tuple(x.shape)}  "
-                          f"tokens={_t}  dtype={x.dtype}  device={x.device}")
+                          f"tokens={x.shape[1]}  dtype={x.dtype}  device={x.device}")
 
                 # ── Recompute adaLN modulation (always — cheap) ─────────────
                 cast = comfy.model_management.cast_to
@@ -1049,121 +850,33 @@ class ShannonPrimeWanBlockSkip:
                     e_mods = (cast(blk.modulation, dtype=x.dtype, device=x.device)
                               .unsqueeze(0) + e).unbind(2)
 
-                eff_win  = state['effective_win'].get(block_idx, 0)
                 cached_s = state['step_cached'].get(block_idx, -999)
-                age      = step - cached_s
-
-                # ── Mertens Oracle: preemptive x_drift check ────────────────
-                # Tier-0 (L00-L03): disabled (x_drift_t0=0.0 default).
-                #   Sim=1.000 data confirms these blocks are pure Granite;
-                #   the rolling oracle handles them without drift interference.
-                # Tier-1 (L04-L08): per-block tightening toward the boundary.
-                #   L04 is most stable (near Granite); L08 is most volatile
-                #   (Sand/boundary). Threshold decreases linearly from t1 to t1*0.8.
-                x_drift_forced_miss = False
-                if block_idx < 4:
-                    x_drift_thr = state['x_drift_t0']   # disabled for Granite
-                else:
-                    # Linear tightening within tier-1: L04 → t1, L08 → t1*0.80
-                    _frac = (block_idx - 4) / 4.0        # 0.0 at L04, 1.0 at L08
-                    x_drift_thr = state['x_drift_t1'] * (1.0 - 0.20 * _frac)
-                _has_cache = (vht2_cache.has(block_idx) if vht2_cache is not None
-                              else block_idx in state['attn_cache'])
-                if (x_drift_thr > 0.0 and eff_win > 0 and age > 0
-                        and block_idx in state['x_norm']
-                        and _has_cache):
-                    x_dr = _x_norm_drift(x, state['x_norm'][block_idx])
-                    if x_dr > x_drift_thr:
-                        x_drift_forced_miss = True
-                        state['effective_win'][block_idx] = max(1, eff_win // 2)
-                        if verbose:
-                            print(f"[SP BlockSkip] B{block_idx:02d} x-DRIFT "
-                                  f"step={step} drift={x_dr:.3f}>{x_drift_thr:.2f}"
-                                  f" -> forced miss, win halved to "
-                                  f"{state['effective_win'][block_idx]}")
-
-                # Adaptive streak: force a miss after max_streak consecutive hits
-                # so the oracle can observe fresh y and update rolling_sim.
-                # Streak limit adapts to the oracle's own rolling_sim:
-                #   rolling_sim > 0.95  (proven Granite) → allow up to 10 hits
-                #   rolling_sim > 0.90  (stable)         → allow up to 7 hits
-                #   rolling_sim > 0.85  (drifting)       → allow up to 5 hits  (default)
-                #   rolling_sim ≤ 0.85  (volatile)       → allow only 3 hits
-                # This is self-calibrating: no sigma knowledge required.
-                _rsim = state['rolling_sim'].get(block_idx, 1.0)
-                if _rsim > 0.95:
-                    _adaptive_streak = 10
-                elif _rsim > 0.90:
-                    _adaptive_streak = 7
-                elif _rsim > 0.85:
-                    _adaptive_streak = 5
-                else:
-                    _adaptive_streak = 3
+                age = step - cached_s
                 streak = state['hit_streak'].get(block_idx, 0)
-                streak_forced_miss = (eff_win > 0 and streak >= _adaptive_streak
-                                      and _has_cache)
-                if streak_forced_miss:
-                    state['hit_streak'][block_idx] = 0   # reset counter
-                    if verbose:
-                        print(f"[SP BlockSkip] B{block_idx:02d} STREAK-MISS "
-                              f"step={step} streak={streak}>={_adaptive_streak} "
-                              f"(sim={_rsim:.3f}) -> oracle refresh")
+                cached_y = state['attn_cache'].get(block_idx)
 
-                # Shape validation: cached y must match current x token count.
-                # Mismatch = stale cache from a different resolution or prompt
-                # (e.g., 480p y reused in a 720p run → scan-line warping).
-                if vht2_cache is not None:
-                    _cached_shape = vht2_cache.shape(block_idx)
-                    has_cached = _cached_shape is not None
-                    shape_ok = (has_cached
-                                and _cached_shape[0] == x.shape[0]
-                                and _cached_shape[1] == x.shape[1])
-                    if not shape_ok and has_cached:
-                        vht2_cache.pop(block_idx)
-                        state['x_norm'].pop(block_idx, None)
-                        state['step_cached'].pop(block_idx, None)
-                else:
-                    cached_y = state['attn_cache'].get(block_idx)
-                    has_cached = cached_y is not None
-                    shape_ok = (has_cached
-                                and cached_y.shape[0] == x.shape[0]
-                                and cached_y.shape[1] == x.shape[1])
-                    if not shape_ok and has_cached:
-                        del state['attn_cache'][block_idx]
-                        state['x_norm'].pop(block_idx, None)
-                        state['step_cached'].pop(block_idx, None)
+                # Shape validation
+                shape_ok = (cached_y is not None
+                            and cached_y.shape[0] == x.shape[0]
+                            and cached_y.shape[1] == x.shape[1])
+                if not shape_ok and cached_y is not None:
+                    del state['attn_cache'][block_idx]
+                    state['step_cached'].pop(block_idx, None)
+                    cached_y = None
 
-                if (not x_drift_forced_miss and not streak_forced_miss
-                        and shape_ok
-                        and eff_win > 0
-                        and age >= 0          # age < 0 = stale from prev generation
-                        and age < eff_win):
-                    # ── CACHE HIT ─────────────────────────────────────────────
-                    # Hierarchical: Tier 0 (GPU) = zero transfer,
-                    #               Tier 1 (CPU) = .to(device)
-                    if vht2_cache is not None:
-                        y = vht2_cache.get(block_idx, x.device, x.dtype)
-                    elif cached_y.device == x.device:
-                        y = cached_y  # GPU-resident hot block — zero overhead
-                    else:
-                        y = cached_y.to(device=x.device, dtype=x.dtype)
+                # ── CACHE HIT: within window, not streak-forced-miss ────────
+                if (cached_y is not None
+                        and age >= 0 and age < window
+                        and streak < _streak_limit):
+                    # CPU fp16 → GPU: ~40MB at ~12 GB/s PCIe = ~3ms. Negligible.
+                    y = cached_y.to(device=x.device, dtype=x.dtype)
                     x = torch.addcmul(x.contiguous(), y,
                                       repeat_e(e_mods[2], x))
-                    state['hit_streak'][block_idx] = state['hit_streak'].get(block_idx, 0) + 1
+                    state['hit_streak'][block_idx] = streak + 1
                     if verbose:
-                        streak_now = state['hit_streak'].get(block_idx, 0)
-                        _rsim_hit  = state['rolling_sim'].get(block_idx, 1.0)
-                        # _adaptive_streak already computed above in the streak check
-                        if _rsim_hit > 0.95:   _lim = 10
-                        elif _rsim_hit > 0.90: _lim = 7
-                        elif _rsim_hit > 0.85: _lim = 5
-                        else:                  _lim = 3
-                        _tier = "GPU" if (vht2_cache is None and cached_y is not None
-                                          and cached_y.device != torch.device('cpu')) else (
-                                "VHT2" if vht2_cache is not None else "CPU")
                         print(f"[SP BlockSkip] B{block_idx:02d} HIT  "
-                              f"step={step} age={age}/{eff_win} streak={streak_now}/{_lim} "
-                              f"sim={_rsim_hit:.3f} tier={_tier}")
+                              f"step={step} age={age}/{window} "
+                              f"streak={streak+1}/{_streak_limit} CPU/fp16")
                 else:
                     # ── CACHE MISS: run self-attention ─────────────────────────
                     x = x.contiguous()
@@ -1174,84 +887,16 @@ class ShannonPrimeWanBlockSkip:
                         freqs, transformer_options=transformer_options
                     )
 
-                    # ── Y-tensor dump (spectral analysis) ─────────────────────
-                    if state['dump_y'] and block_idx not in state['dump_y_data']:
-                        # First miss per block per generation: save y for analysis
-                        y_np = y.detach().float().cpu().numpy()
-                        state['dump_y_data'][block_idx] = (step, y_np)
-                        if verbose:
-                            print(f"[SP BlockSkip] B{block_idx:02d} DUMP y shape={y_np.shape}")
+                    # Store y on CPU fp16 — zero GPU memory pressure.
+                    # ~40MB per block, 9 blocks = ~360MB CPU. Transfer on hit
+                    # is ~3ms/block via PCIe — invisible against step time.
+                    state['attn_cache'][block_idx] = y.detach().cpu()
+                    state['step_cached'][block_idx] = step
+                    state['hit_streak'][block_idx] = 0
 
-                    # ── Mertens Oracle: update rolling cos_sim ─────────────────
-                    # CRITICAL: cos_sim must NOT allocate GPU memory for the
-                    # comparison. The old path did vht2_cache.get() (full GPU
-                    # decompress) or .to(device=cuda) (98MB CPU→GPU transfer)
-                    # per block per miss, fragmenting the CUDA allocator and
-                    # causing step times to double each iteration.
-                    #
-                    # Fix: VHT2 mode uses compare_spectral() — dequantize on
-                    # CPU, compare in spectral domain (cos_sim is invariant
-                    # under orthogonal transforms). Raw mode computes cos_sim
-                    # entirely on CPU. Zero GPU memory allocated.
-                    _has_prev = (vht2_cache.has(block_idx) if vht2_cache is not None
-                                 else block_idx in state['attn_cache'])
-                    if _has_prev and eff_win > 0:
-                        if vht2_cache is not None:
-                            # Spectral cos_sim: no GPU decompress needed
-                            sim = vht2_cache.compare_spectral(block_idx, y)
-                        else:
-                            prev = state['attn_cache'][block_idx]
-                            if prev.device == y.device:
-                                # GPU-resident: compute cos_sim on GPU (fast, no transfer)
-                                y_f = y.detach().float().reshape(-1)
-                                p_f = prev.float().reshape(-1)
-                                dot = (y_f * p_f).sum()
-                                norms = (y_f.norm() * p_f.norm()).clamp_(min=1e-10)
-                                sim = float((dot / norms).item())
-                                del y_f, p_f
-                            else:
-                                # CPU cos_sim: no GPU allocation needed
-                                y_cpu = y.detach().float().cpu().reshape(-1)
-                                y_prev_flat = prev.float().reshape(-1)
-                                dot = (y_cpu * y_prev_flat).sum()
-                                norms = (y_cpu.norm() * y_prev_flat.norm()).clamp_(min=1e-10)
-                                sim = float((dot / norms).item())
-                                del y_cpu, y_prev_flat
-                        # Exponential moving average
-                        state['rolling_sim'][block_idx] = (
-                            0.7 * state['rolling_sim'].get(block_idx, 1.0)
-                            + 0.3 * sim
-                        )
-                        # Adaptive window: halve on drift, restore on stability
-                        nom_win = get_window(block_idx)
-                        if state['rolling_sim'][block_idx] < drift_threshold:
-                            state['effective_win'][block_idx] = max(1, nom_win // 2)
-                        elif state['rolling_sim'][block_idx] > 0.92:
-                            state['effective_win'][block_idx] = nom_win
-
-                        if verbose:
-                            print(f"[SP BlockSkip] B{block_idx:02d} MISS "
-                                  f"step={step} sim={sim:.3f} "
-                                  f"roll={state['rolling_sim'][block_idx]:.3f} "
-                                  f"win={state['effective_win'][block_idx]}")
-
-                    # Store y — hierarchical GPU/CPU tiering
-                    # Tier 0 (L00-L03): GPU-resident — zero overhead on hit
-                    # Tier 1 (L04-L08): CPU — fast .to(device) on hit
-                    # VHT2 (optional): spectral compressed on CPU
-                    if vht2_cache is not None:
-                        vht2_cache.put(block_idx, y.detach())
-                    elif block_idx < 4 and eff_win > 0:
-                        # Hot block: keep on GPU for zero-cost cache hits
-                        state['attn_cache'][block_idx] = y.detach()
-                    else:
-                        state['attn_cache'][block_idx] = y.detach().cpu()
-                    # Store ONLY per-token norms of x (not full x tensor).
-                    # Full x at 720p = 66MB per block = 594MB total held across VAE decode.
-                    # Per-token norm = 43KB per block. Eliminates the 142-second VAE penalty.
-                    state['x_norm'][block_idx]       = x.float().norm(dim=-1).squeeze().cpu()
-                    state['step_cached'][block_idx]  = step
-                    state['hit_streak'][block_idx]   = 0   # reset on miss
+                    if verbose:
+                        print(f"[SP BlockSkip] B{block_idx:02d} MISS "
+                              f"step={step} CPU/fp16")
 
                     x = torch.addcmul(x, y, repeat_e(e_mods[2], x))
                     del y
@@ -1286,30 +931,12 @@ class ShannonPrimeWanBlockSkip:
 
         tier0 = [i for i, _ in blocks if i < 4]
         tier1 = [i for i, _ in blocks if 4 <= i < 9]
-        print(f"[SP BlockSkip] Patched {n_patched}/{n_blocks} WanAttentionBlock.forward()")
-        print(f"[SP BlockSkip] Tier-0 win={tier_0_window}: blocks {tier0}")
-        print(f"[SP BlockSkip] Tier-1 win={tier_1_window}: blocks {tier1}")
-        print(f"[SP BlockSkip] Mertens Oracle drift_threshold={drift_threshold:.2f}")
-        print(f"[SP BlockSkip] x-drift: T0={'disabled' if x_drift_t0==0.0 else x_drift_t0} "
-              f"T1={x_drift_t1}  (0.0=disabled, trust oracle)")
-        print(f"[SP BlockSkip] Savings: self-attn Q+K+V+scores skipped on cache hits "
-              f"(~50% compute for patched blocks)")
-        # ── Settings summary for this run ──────────────────────────────────────
-        try:
-            _head_dim = next(
-                (getattr(blk, 'self_attn', None) for _, blk in blocks if
-                 getattr(blk, 'self_attn', None) is not None), None
-            )
-            _vht2_str = "ON (~3.5x)" if vht2_cache is not None else "OFF (raw fp16)"
-            print(f"[SP BlockSkip] ── Run settings ──────────────────────────────────────────")
-            print(f"[SP BlockSkip]   blocks={n_blocks}  tier0_win={tier_0_window}  tier1_win={tier_1_window}")
-            print(f"[SP BlockSkip]   drift_thr={drift_threshold}  x_drift_t0={x_drift_t0}  x_drift_t1={x_drift_t1}")
-            print(f"[SP BlockSkip]   vht2_compress={_vht2_str}  verbose={verbose}")
-            print(f"[SP BlockSkip]   streak=adaptive(sim>0.95→10, >0.90→7, >0.85→5, else→3)")
-        except Exception:
-            pass
-        print(f"[SP BlockSkip] Savings: self-attn Q+K+V+scores skipped on cache hits "
-              f"(~50% compute for patched blocks)")
+        print(f"[SP BlockSkip] Phase 15 LEAN — patched {n_patched}/{n_blocks} blocks")
+        print(f"[SP BlockSkip] ALL CPU/fp16 (lowvram-safe, no GPU memory pinned)")
+        print(f"[SP BlockSkip] Tier-0 win={tier_0_window}: {tier0}")
+        print(f"[SP BlockSkip] Tier-1 win={tier_1_window}: {tier1}")
+        print(f"[SP BlockSkip] Streak limits: tier-0=10, tier-1=5")
+        print(f"[SP BlockSkip] Zero overhead: no oracle, no x_drift, no cos_sim")
 
         return (patched,)
 

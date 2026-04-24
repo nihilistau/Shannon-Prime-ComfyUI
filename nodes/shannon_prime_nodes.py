@@ -601,8 +601,12 @@ class ShannonPrimeWanBlockSkip:
                     "tooltip": "Cache window for L04-L08 (Stable Sand). 0=disabled."}),
                 "tier_2_window": ("INT",   {"default": 0,  "min": 0, "max": 10,
                     "tooltip": "Cache window for L09-L15 (Volatile). 0=disabled. Try 2 for SVI 3-step."}),
+                "tier_3_window": ("INT",   {"default": 0,  "min": 0, "max": 5,
+                    "tooltip": "Cache window for L16-L39 (Deep/late — texture detail). 0=disabled. YOLO: try 2 for SVI."}),
                 "cache_ffn": ("BOOLEAN", {"default": False,
                     "tooltip": "TURBO: also cache FFN output. Hit steps become near-zero compute. May affect quality on long schedules."}),
+                "cache_dtype": (["fp16", "fp8"], {"default": "fp16",
+                    "tooltip": "Cache storage dtype. fp8 halves CPU memory and PCIe transfer but clips values >448. Safe for short schedules."}),
                 "verbose": ("BOOLEAN", {"default": False,
                     "tooltip": "Print per-block HIT/MISS logs to console"}),
             },
@@ -613,7 +617,8 @@ class ShannonPrimeWanBlockSkip:
         return float("nan")
 
     def patch(self, model, tier_0_window=10, tier_1_window=3,
-              tier_2_window=0, cache_ffn=False,
+              tier_2_window=0, tier_3_window=0,
+              cache_ffn=False, cache_dtype="fp16",
               verbose=False, **_ignored):
         import types
         import comfy.model_management
@@ -667,9 +672,14 @@ class ShannonPrimeWanBlockSkip:
                 return tier_1_window
             if i < 16:
                 return tier_2_window
-            return 0
+            return tier_3_window
 
         _do_ffn = cache_ffn  # closure capture
+        _use_fp8 = (cache_dtype == "fp8")
+        if _use_fp8:
+            _store_dtype = torch.float8_e4m3fn
+        else:
+            _store_dtype = torch.float16
 
         # Shared state across all patched blocks
         state = {
@@ -745,15 +755,27 @@ class ShannonPrimeWanBlockSkip:
                        and age >= 0 and age < window
                        and streak < _streak_limit)
 
+                # ── Helper: load cached tensor to GPU ──────────────────────
+                # fp8: cast to compute dtype on CPU first (safe software path),
+                # then transfer. Avoids combined device+dtype .to() hang on Turing.
+                def _load(t):
+                    if _use_fp8:
+                        return t.to(dtype=x.dtype).to(device=x.device)
+                    return t.to(device=x.device, dtype=x.dtype)
+
+                # ── Helper: store tensor to CPU cache ──────────────────────
+                def _store(t):
+                    return t.detach().to(dtype=_store_dtype).cpu()
+
                 if hit:
                     # Self-attn: cached pre-gate y + current step's gate
-                    y = cached_y.to(device=x.device, dtype=x.dtype)
+                    y = _load(cached_y)
                     x = torch.addcmul(x.contiguous(), y,
                                       repeat_e(e_mods[2], x))
                     del y
 
                     # Cross-attn: cached output is a plain residual add
-                    xa = cached_xa.to(device=x.device, dtype=x.dtype)
+                    xa = _load(cached_xa)
                     x = x + xa
                     del xa
 
@@ -761,21 +783,19 @@ class ShannonPrimeWanBlockSkip:
 
                     # ── TURBO: FFN also cached ─────────────────────────────
                     if _do_ffn and cached_ff is not None:
-                        yf = cached_ff.to(device=x.device, dtype=x.dtype)
+                        yf = _load(cached_ff)
                         x = torch.addcmul(x, yf, repeat_e(e_mods[5], x))
                         del yf
                         if verbose:
                             print(f"[SP BlockSkip] B{block_idx:02d} HIT  "
                                   f"step={step} age={age}/{window} "
-                                  f"streak={streak+1}/{_streak_limit} "
-                                  f"TURBO self+cross+ffn")
+                                  f"streak={streak+1}/{_streak_limit} TURBO")
                         return x
 
                     if verbose:
                         print(f"[SP BlockSkip] B{block_idx:02d} HIT  "
                               f"step={step} age={age}/{window} "
-                              f"streak={streak+1}/{_streak_limit} "
-                              f"self+cross")
+                              f"streak={streak+1}/{_streak_limit}")
                 else:
                     # ── CACHE MISS: run self-attention ────────────────────────
                     x = x.contiguous()
@@ -785,7 +805,7 @@ class ShannonPrimeWanBlockSkip:
                                       1 + repeat_e(e_mods[1], x)),
                         freqs, transformer_options=transformer_options
                     )
-                    state['attn_cache'][block_idx] = y.detach().cpu()
+                    state['attn_cache'][block_idx] = _store(y)
 
                     x = torch.addcmul(x, y, repeat_e(e_mods[2], x))
                     del y
@@ -796,7 +816,7 @@ class ShannonPrimeWanBlockSkip:
                         context_img_len=context_img_len,
                         transformer_options=transformer_options
                     )
-                    state['xattn_cache'][block_idx] = xa.detach().cpu()
+                    state['xattn_cache'][block_idx] = _store(xa)
                     state['step_cached'][block_idx] = step
                     state['hit_streak'][block_idx] = 0
 
@@ -818,7 +838,7 @@ class ShannonPrimeWanBlockSkip:
                                           blk.norm2(x),
                                           1 + repeat_e(e_mods[4], x)))
                 if _do_ffn:
-                    state['ffn_cache'][block_idx] = y.detach().cpu()
+                    state['ffn_cache'][block_idx] = _store(y)
                 x = torch.addcmul(x, y, repeat_e(e_mods[5], x))
                 return x
 
@@ -836,18 +856,22 @@ class ShannonPrimeWanBlockSkip:
         tier0 = [i for i, _ in blocks if i < 4 and get_window(i) > 0]
         tier1 = [i for i, _ in blocks if 4 <= i < 9 and get_window(i) > 0]
         tier2 = [i for i, _ in blocks if 9 <= i < 16 and get_window(i) > 0]
-        mode = "TURBO (self+cross+FFN)" if cache_ffn else "self+cross"
-        print(f"[SP BlockSkip] Phase 15 FULL SEND — patched {n_patched}/{n_blocks} blocks, mode={mode}")
+        tier3 = [i for i, _ in blocks if i >= 16 and get_window(i) > 0]
+        mode = "TURBO" if cache_ffn else "self+cross"
+        dtype_str = "fp8" if _use_fp8 else "fp16"
+        print(f"[SP BlockSkip] Phase 15 FULL SEND — {n_patched}/{n_blocks} blocks, {mode}, {dtype_str}")
         if tier0:
             print(f"[SP BlockSkip] Tier-0 win={tier_0_window} streak=10: {tier0}")
         if tier1:
             print(f"[SP BlockSkip] Tier-1 win={tier_1_window} streak=5:  {tier1}")
         if tier2:
             print(f"[SP BlockSkip] Tier-2 win={tier_2_window} streak=3:  {tier2}")
+        if tier3:
+            print(f"[SP BlockSkip] Tier-3 win={tier_3_window} streak=3:  {tier3}")
         if cache_ffn:
-            print(f"[SP BlockSkip] TURBO: on HIT, ENTIRE block skipped (only adaLN + 3 transfers)")
+            print(f"[SP BlockSkip] TURBO: on HIT, ENTIRE block skipped (adaLN + 3 transfers)")
         else:
-            print(f"[SP BlockSkip] On HIT: adaLN + FFN run. Self-attn + cross-attn SKIPPED.")
+            print(f"[SP BlockSkip] On HIT: adaLN + FFN. Self-attn + cross-attn SKIPPED.")
 
         return (patched,)
 

@@ -599,6 +599,10 @@ class ShannonPrimeWanBlockSkip:
                     "tooltip": "Cache window for L00-L03 (Permanent Granite). 0=disabled."}),
                 "tier_1_window": ("INT",   {"default": 3,  "min": 0, "max": 15,
                     "tooltip": "Cache window for L04-L08 (Stable Sand). 0=disabled."}),
+                "tier_2_window": ("INT",   {"default": 0,  "min": 0, "max": 10,
+                    "tooltip": "Cache window for L09-L15 (Volatile). 0=disabled. Try 2 for SVI 3-step."}),
+                "cache_ffn": ("BOOLEAN", {"default": False,
+                    "tooltip": "TURBO: also cache FFN output. Hit steps become near-zero compute. May affect quality on long schedules."}),
                 "verbose": ("BOOLEAN", {"default": False,
                     "tooltip": "Print per-block HIT/MISS logs to console"}),
             },
@@ -609,6 +613,7 @@ class ShannonPrimeWanBlockSkip:
         return float("nan")
 
     def patch(self, model, tier_0_window=10, tier_1_window=3,
+              tier_2_window=0, cache_ffn=False,
               verbose=False, **_ignored):
         import types
         import comfy.model_management
@@ -643,6 +648,7 @@ class ShannonPrimeWanBlockSkip:
                         if isinstance(_obj, dict) and "attn_cache" in _obj:
                             _obj["attn_cache"].clear()
                             _obj.get("xattn_cache", {}).clear()
+                            _obj.get("ffn_cache", {}).clear()
                             _obj.get("step_cached", {}).clear()
                             _obj.get("hit_streak", {}).clear()
                             _cleared += 1
@@ -659,24 +665,31 @@ class ShannonPrimeWanBlockSkip:
                 return tier_0_window
             if i < 9:
                 return tier_1_window
+            if i < 16:
+                return tier_2_window
             return 0
 
-        # Shared state across all patched blocks — lean Phase 15
-        # No oracle, no x_drift, no rolling_sim, no runtime gen detection.
-        # Fixed windows from Phase 12 data. All caches CPU/fp16.
+        _do_ffn = cache_ffn  # closure capture
+
+        # Shared state across all patched blocks
         state = {
-            'global_step':    [0],      # step counter (incremented by block-0)
-            'hit_streak':     {},       # block_idx -> consecutive cache-hit count
-            'attn_cache':     {},       # block_idx -> self-attn y tensor (CPU fp16)
-            'xattn_cache':    {},       # block_idx -> cross-attn output tensor (CPU fp16)
-            'step_cached':    {},       # block_idx -> step at which caches were filled
+            'global_step':    [0],
+            'hit_streak':     {},
+            'attn_cache':     {},       # block_idx -> self-attn y (CPU fp16)
+            'xattn_cache':    {},       # block_idx -> cross-attn output (CPU fp16)
+            'ffn_cache':      {},       # block_idx -> FFN pre-gate y (CPU fp16) [turbo]
+            'step_cached':    {},
         }
 
         def make_patched_forward(orig_forward, block_idx, blk):
             window = get_window(block_idx)
-            # Fixed streak limit: force a miss every N hits to refresh cache.
-            # Phase 12 data: tier-0 sim>0.95, tier-1 sim>0.90 — safe to trust.
-            _streak_limit = 10 if block_idx < 4 else 5
+            # Streak limit: force a miss every N hits to refresh cache.
+            if block_idx < 4:
+                _streak_limit = 10    # tier-0: sim>0.95
+            elif block_idx < 9:
+                _streak_limit = 5     # tier-1: sim>0.90
+            else:
+                _streak_limit = 3     # tier-2: volatile, refresh often
 
             def patched_forward(x, e, freqs, context,
                                 context_img_len=257,
@@ -711,19 +724,22 @@ class ShannonPrimeWanBlockSkip:
                 streak = state['hit_streak'].get(block_idx, 0)
                 cached_y = state['attn_cache'].get(block_idx)
                 cached_xa = state['xattn_cache'].get(block_idx)
+                cached_ff = state['ffn_cache'].get(block_idx) if _do_ffn else None
 
-                # Shape validation — invalidate both caches together
+                # Shape validation — invalidate all caches together
                 shape_ok = (cached_y is not None
                             and cached_y.shape[0] == x.shape[0]
                             and cached_y.shape[1] == x.shape[1])
                 if not shape_ok and cached_y is not None:
                     state['attn_cache'].pop(block_idx, None)
                     state['xattn_cache'].pop(block_idx, None)
+                    state['ffn_cache'].pop(block_idx, None)
                     state['step_cached'].pop(block_idx, None)
                     cached_y = None
                     cached_xa = None
+                    cached_ff = None
 
-                # ── CACHE HIT: skip BOTH self-attn AND cross-attn ──────────
+                # ── CACHE HIT ──────────────────────────────────────────────
                 hit = (cached_y is not None
                        and cached_xa is not None
                        and age >= 0 and age < window
@@ -742,11 +758,24 @@ class ShannonPrimeWanBlockSkip:
                     del xa
 
                     state['hit_streak'][block_idx] = streak + 1
+
+                    # ── TURBO: FFN also cached ─────────────────────────────
+                    if _do_ffn and cached_ff is not None:
+                        yf = cached_ff.to(device=x.device, dtype=x.dtype)
+                        x = torch.addcmul(x, yf, repeat_e(e_mods[5], x))
+                        del yf
+                        if verbose:
+                            print(f"[SP BlockSkip] B{block_idx:02d} HIT  "
+                                  f"step={step} age={age}/{window} "
+                                  f"streak={streak+1}/{_streak_limit} "
+                                  f"TURBO self+cross+ffn")
+                        return x
+
                     if verbose:
                         print(f"[SP BlockSkip] B{block_idx:02d} HIT  "
                               f"step={step} age={age}/{window} "
                               f"streak={streak+1}/{_streak_limit} "
-                              f"self+cross CPU/fp16")
+                              f"self+cross")
                 else:
                     # ── CACHE MISS: run self-attention ────────────────────────
                     x = x.contiguous()
@@ -776,7 +805,7 @@ class ShannonPrimeWanBlockSkip:
 
                     if verbose:
                         print(f"[SP BlockSkip] B{block_idx:02d} MISS "
-                              f"step={step} self+cross CPU/fp16")
+                              f"step={step}")
 
                 # ── attn2 patches (ControlNet etc) — always run ─────────────
                 patches = transformer_options.get("patches", {})
@@ -784,10 +813,12 @@ class ShannonPrimeWanBlockSkip:
                     for p in patches["attn2_patch"]:
                         x = p({"x": x, "transformer_options": transformer_options})
 
-                # ── FFN (always fresh) ───────────────────────────────────────
+                # ── FFN ──────────────────────────────────────────────────────
                 y = blk.ffn(torch.addcmul(repeat_e(e_mods[3], x),
                                           blk.norm2(x),
                                           1 + repeat_e(e_mods[4], x)))
+                if _do_ffn:
+                    state['ffn_cache'][block_idx] = y.detach().cpu()
                 x = torch.addcmul(x, y, repeat_e(e_mods[5], x))
                 return x
 
@@ -802,13 +833,21 @@ class ShannonPrimeWanBlockSkip:
                 blk.forward = make_patched_forward(orig, i, blk)
                 n_patched += 1
 
-        tier0 = [i for i, _ in blocks if i < 4]
-        tier1 = [i for i, _ in blocks if 4 <= i < 9]
-        print(f"[SP BlockSkip] Phase 15 ALL THE WAY — patched {n_patched}/{n_blocks} blocks")
-        print(f"[SP BlockSkip] Self-attn + cross-attn BOTH cached, CPU/fp16")
-        print(f"[SP BlockSkip] Tier-0 win={tier_0_window}: {tier0}")
-        print(f"[SP BlockSkip] Tier-1 win={tier_1_window}: {tier1}")
-        print(f"[SP BlockSkip] On HIT: only adaLN + FFN run. Self-attn + cross-attn SKIPPED.")
+        tier0 = [i for i, _ in blocks if i < 4 and get_window(i) > 0]
+        tier1 = [i for i, _ in blocks if 4 <= i < 9 and get_window(i) > 0]
+        tier2 = [i for i, _ in blocks if 9 <= i < 16 and get_window(i) > 0]
+        mode = "TURBO (self+cross+FFN)" if cache_ffn else "self+cross"
+        print(f"[SP BlockSkip] Phase 15 FULL SEND — patched {n_patched}/{n_blocks} blocks, mode={mode}")
+        if tier0:
+            print(f"[SP BlockSkip] Tier-0 win={tier_0_window} streak=10: {tier0}")
+        if tier1:
+            print(f"[SP BlockSkip] Tier-1 win={tier_1_window} streak=5:  {tier1}")
+        if tier2:
+            print(f"[SP BlockSkip] Tier-2 win={tier_2_window} streak=3:  {tier2}")
+        if cache_ffn:
+            print(f"[SP BlockSkip] TURBO: on HIT, ENTIRE block skipped (only adaLN + 3 transfers)")
+        else:
+            print(f"[SP BlockSkip] On HIT: adaLN + FFN run. Self-attn + cross-attn SKIPPED.")
 
         return (patched,)
 
@@ -865,9 +904,12 @@ class ShannonPrimeWanCacheFlush:
                     except ValueError:
                         continue
                     if isinstance(obj, dict) and "attn_cache" in obj:
-                        n = len(obj["attn_cache"]) + len(obj.get("xattn_cache", {}))
+                        n = (len(obj["attn_cache"])
+                             + len(obj.get("xattn_cache", {}))
+                             + len(obj.get("ffn_cache", {})))
                         obj["attn_cache"].clear()
                         obj.get("xattn_cache", {}).clear()
+                        obj.get("ffn_cache", {}).clear()
                         obj.get("step_cached", {}).clear()
                         obj.get("hit_streak", {}).clear()
                         if n > 0:

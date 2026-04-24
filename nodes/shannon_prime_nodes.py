@@ -977,12 +977,19 @@ class ShannonPrimeWanBlockSkip:
                     state['global_step'][0] += 1
                 step = state['global_step'][0]
 
-                # Detect new generation: step jumped back or reset.
-                # Clear all cached tensors so they don't eat memory during VAE decode.
+                # Detect new generation: any y in the cache has step_cached > current step
+                # (negative age) or the step jumped back to <=2.
+                # The age >= 0 check in the hit condition already prevents stale hits,
+                # but we also purge to free memory at generation boundaries.
                 last = state['last_gen_step'][0]
-                if block_idx == 0 and last > 0 and step <= 2 and last > 5:
+                # Fire if: a significant fraction of cached blocks have negative age
+                stale_blocks = sum(1 for b, s in state['step_cached'].items()
+                                   if state['global_step'][0] - s < 0)
+                new_gen = (block_idx == 0 and last > 0
+                           and (stale_blocks > 0 or (step <= 2 and last > 5)))
+                if new_gen:
                     if verbose:
-                        print(f"[SP BlockSkip] New generation detected — clearing cache")
+                        print(f"[SP BlockSkip] New generation detected (stale={stale_blocks}) — clearing cache")
                     state['attn_cache'].clear()
                     state['step_cached'].clear()
                     state['x_norm'].clear()
@@ -1039,13 +1046,26 @@ class ShannonPrimeWanBlockSkip:
                         print(f"[SP BlockSkip] B{block_idx:02d} STREAK-MISS "
                               f"step={step} streak={streak}>={max_streak} -> oracle refresh")
 
+                # Shape validation: cached y must match current x token count.
+                # Mismatch = stale cache from a different resolution or prompt
+                # (e.g., 480p y reused in a 720p run → scan-line warping).
+                cached_y = state['attn_cache'].get(block_idx)
+                shape_ok = (cached_y is not None
+                            and cached_y.shape[0] == x.shape[0]   # batch
+                            and cached_y.shape[1] == x.shape[1])  # tokens
+                if not shape_ok and cached_y is not None:
+                    # Resolution or batch changed — purge stale cache
+                    del state['attn_cache'][block_idx]
+                    state['x_norm'].pop(block_idx, None)
+                    state['step_cached'].pop(block_idx, None)
+
                 if (not x_drift_forced_miss and not streak_forced_miss
+                        and shape_ok
                         and eff_win > 0
-                        and age < eff_win
-                        and block_idx in state['attn_cache']):
+                        and age >= 0          # age < 0 = stale from prev generation
+                        and age < eff_win):
                     # ── CACHE HIT ─────────────────────────────────────────────
-                    y = state['attn_cache'][block_idx].to(device=x.device,
-                                                          dtype=x.dtype)
+                    y = cached_y.to(device=x.device, dtype=x.dtype)
                     x = torch.addcmul(x.contiguous(), y,
                                       repeat_e(e_mods[2], x))
                     state['hit_streak'][block_idx] = state['hit_streak'].get(block_idx, 0) + 1

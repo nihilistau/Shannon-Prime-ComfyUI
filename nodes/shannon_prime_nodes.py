@@ -765,6 +765,12 @@ class ShannonPrimeWanBlockSkip:
                         "Lossy but the adaLN gate re-anchoring tolerates small errors."
                     )}),
                 "verbose": ("BOOLEAN", {"default": False}),
+                "dump_y_npz": ("BOOLEAN", {"default": False,
+                    "tooltip": (
+                        "Dump self-attn y tensors to .npz for spectral analysis. "
+                        "Saves per-step y on first miss per block per generation. "
+                        "Use with SVI hi+lo to compare spectral profiles."
+                    )}),
             },
         }
 
@@ -776,7 +782,7 @@ class ShannonPrimeWanBlockSkip:
               drift_threshold=0.85,
               x_drift_t0=0.30, x_drift_t1=0.25,
               vht2_compress=True,
-              verbose=False):
+              verbose=False, dump_y_npz=False):
         import types
         import comfy.model_management
 
@@ -874,6 +880,10 @@ class ShannonPrimeWanBlockSkip:
             # Per-tier x_drift thresholds (0.0 = disabled)
             'x_drift_t0': x_drift_t0,   # Tier-0 (L00-L03): default disabled
             'x_drift_t1': x_drift_t1,   # Tier-1 (L04-L08): default 0.25
+            # Y-tensor dump for spectral analysis (dump_y_npz=True)
+            'dump_y': dump_y_npz,
+            'dump_y_data': {},   # block_idx -> list of (step, y_cpu) tuples
+            'dump_y_gen': [0],   # generation counter for file naming
         }
         for i, _ in blocks:
             w = get_window(i)
@@ -900,6 +910,29 @@ class ShannonPrimeWanBlockSkip:
             ref_mean = ref_norm.mean().clamp(min=1e-10)
             drift    = (cur_norm - ref_norm).abs().mean()
             return float(drift / ref_mean)
+
+        def _flush_y_dump(st):
+            """Save accumulated y-tensor data to npz and clear."""
+            import numpy as _np
+            gen = st['dump_y_gen'][0]
+            st['dump_y_gen'][0] = gen + 1
+            out_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                                   "lib", "shannon-prime", "logs", "phase12")
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, f"wan_blockskip_y_gen{gen}.npz")
+            # Build arrays: y_data[block_idx] = (step, y_numpy)
+            blocks_dump = sorted(st['dump_y_data'].keys())
+            save_dict = {'block_indices': _np.array(blocks_dump)}
+            for bidx in blocks_dump:
+                step_num, y_np = st['dump_y_data'][bidx]
+                save_dict[f'y_block{bidx}'] = y_np
+                save_dict[f'step_block{bidx}'] = _np.array([step_num])
+            _np.savez_compressed(out_path, **save_dict)
+            n_blocks = len(blocks_dump)
+            shapes = [st['dump_y_data'][b][1].shape for b in blocks_dump[:3]]
+            print(f"[SP BlockSkip] DUMP saved {n_blocks} blocks to {out_path} "
+                  f"(shapes: {shapes}...)")
+            st['dump_y_data'].clear()
 
         def make_patched_forward(orig_forward, block_idx, blk):
             window = get_window(block_idx)
@@ -976,6 +1009,11 @@ class ShannonPrimeWanBlockSkip:
                     if is_new_gen:
                         if verbose:
                             print(f"[SP BlockSkip] New generation [{gap_reason}] — clearing cache")
+
+                        # ── Flush y-tensor dump if active ──────────────────────
+                        if state['dump_y'] and state['dump_y_data']:
+                            _flush_y_dump(state)
+
                         state['attn_cache'].clear()
                         if vht2_cache is not None:
                             vht2_cache.clear()
@@ -1122,6 +1160,14 @@ class ShannonPrimeWanBlockSkip:
                                       1 + repeat_e(e_mods[1], x)),
                         freqs, transformer_options=transformer_options
                     )
+
+                    # ── Y-tensor dump (spectral analysis) ─────────────────────
+                    if state['dump_y'] and block_idx not in state['dump_y_data']:
+                        # First miss per block per generation: save y for analysis
+                        y_np = y.detach().float().cpu().numpy()
+                        state['dump_y_data'][block_idx] = (step, y_np)
+                        if verbose:
+                            print(f"[SP BlockSkip] B{block_idx:02d} DUMP y shape={y_np.shape}")
 
                     # ── Mertens Oracle: update rolling cos_sim ─────────────────
                     # CRITICAL: cos_sim must NOT allocate GPU memory for the
@@ -1294,6 +1340,26 @@ class ShannonPrimeWanCacheFlush:
                                  if hasattr(c, "cell_contents")]
             for obj in cell_contents:
                 if isinstance(obj, dict) and "attn_cache" in obj:
+                    # Flush y-tensor dump if active
+                    if obj.get('dump_y') and obj.get('dump_y_data'):
+                        import numpy as _np
+                        gen = obj['dump_y_gen'][0]
+                        obj['dump_y_gen'][0] = gen + 1
+                        out_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                                               "lib", "shannon-prime", "logs", "phase12")
+                        os.makedirs(out_dir, exist_ok=True)
+                        out_path = os.path.join(out_dir, f"wan_blockskip_y_gen{gen}.npz")
+                        blocks_dump = sorted(obj['dump_y_data'].keys())
+                        save_dict = {'block_indices': _np.array(blocks_dump)}
+                        for bidx in blocks_dump:
+                            step_num, y_np = obj['dump_y_data'][bidx]
+                            save_dict[f'y_block{bidx}'] = y_np
+                            save_dict[f'step_block{bidx}'] = _np.array([step_num])
+                        _np.savez_compressed(out_path, **save_dict)
+                        print(f"[SP CacheFlush] DUMP saved {len(blocks_dump)} blocks "
+                              f"to {out_path}")
+                        obj['dump_y_data'].clear()
+
                     n = len(obj["attn_cache"])
                     obj["attn_cache"].clear()
                     obj.get("step_cached", {}).clear()

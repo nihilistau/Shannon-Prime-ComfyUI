@@ -1158,9 +1158,15 @@ class ShannonPrimeWanBlockSkip:
                     state['hit_streak'][block_idx] = state['hit_streak'].get(block_idx, 0) + 1
                     if verbose:
                         streak_now = state['hit_streak'].get(block_idx, 0)
+                        _rsim_hit  = state['rolling_sim'].get(block_idx, 1.0)
+                        # _adaptive_streak already computed above in the streak check
+                        if _rsim_hit > 0.95:   _lim = 10
+                        elif _rsim_hit > 0.90: _lim = 7
+                        elif _rsim_hit > 0.85: _lim = 5
+                        else:                  _lim = 3
                         print(f"[SP BlockSkip] B{block_idx:02d} HIT  "
-                              f"step={step} age={age}/{eff_win} streak={streak_now}/{max_streak} "
-                              f"sim={state['rolling_sim'].get(block_idx, 1):.3f}")
+                              f"step={step} age={age}/{eff_win} streak={streak_now}/{_lim} "
+                              f"sim={_rsim_hit:.3f}")
                 else:
                     # ── CACHE MISS: run self-attention ─────────────────────────
                     x = x.contiguous()

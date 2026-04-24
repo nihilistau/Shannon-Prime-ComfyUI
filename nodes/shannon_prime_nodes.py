@@ -1420,24 +1420,214 @@ class ShannonPrimeWanSigmaSwitch:
         return (patched,)
 
 
+class ShannonPrimeWanRicciSentinel:
+    """
+    Phase 13 diagnostic — per-step sigma timeline reporter (Ricci Sentinel).
+
+    Attach after BlockSkip + SigmaSwitch. Hooks block-0 forward and records
+    each denoising step's sigma regime and cache window decisions. At each
+    generation boundary (wall-clock gap > 5s), prints a compact table showing
+    the full timeline so you can verify SigmaSwitch is doing the right thing.
+
+    Output columns:
+      Step   — denoising step number within this generation
+      e_mag  — timestep embedding magnitude (sigma proxy)
+      regime — HIGH (early/Arithmetic Granite) or LOW (late/Semantic Sand)
+      win[0] — effective_win for block 0 (Tier-0 representative)
+      win[4] — effective_win for block 4 (Tier-1 representative)
+      roll_sim[0] — rolling cosine similarity oracle for block 0
+
+    Mechanism: recursively walks block-0's closure chain to find BlockSkip's
+    shared `state` dict (identified by the 'effective_win' key), then reads
+    the per-block window decisions written by SigmaSwitch.
+
+    Workflow: ... → ShannonPrimeWanBlockSkip → ShannonPrimeWanSigmaSwitch
+                 → ShannonPrimeWanRicciSentinel → KSampler → ...
+    """
+
+    CATEGORY     = "shannon-prime"
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION     = "attach"
+    DESCRIPTION  = (
+        "Phase 13 diagnostic: per-step sigma regime + window timeline. "
+        "Attach after BlockSkip + SigmaSwitch. Prints a summary table at "
+        "each generation boundary showing e_mag, HIGH/LOW regime switch point, "
+        "and effective cache windows per tier."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {"model": ("MODEL",)},
+            "optional": {
+                "sigma_split_frac": ("FLOAT", {
+                    "default": 0.5, "min": 0.1, "max": 0.9, "step": 0.05,
+                    "tooltip": "Match SigmaSwitch sigma_split_frac. Used to label HIGH/LOW regimes."}),
+                "verbose": ("BOOLEAN", {"default": True,
+                    "tooltip": "True = print every step. False = only print summary at generation end."}),
+            },
+        }
+
+    @classmethod
+    def IS_CHANGED(cls, *a, **k):
+        return float("nan")
+
+    def attach(self, model, sigma_split_frac=0.5, verbose=True):
+        import time as _time
+
+        patched = model.clone()
+        blocks  = list(_iter_wan_blocks(patched))
+        if not blocks:
+            print("[SP Ricci] no Wan blocks found — passing through")
+            return (patched,)
+
+        sentinel = {
+            'log':       [],       # list of per-step record dicts
+            'e_mag_max': [None],   # rolling max e_mag for this generation
+            'e_mag_min': [None],   # rolling min e_mag for this generation
+            'last_t':    [0.0],    # wall-clock time of last block-0 call
+            'split':     sigma_split_frac,
+        }
+
+        def _find_state(fwd, key, depth=0):
+            """Recursively walk the closure chain to find a dict containing `key`.
+            Handles stacked wrappers: Sentinel -> SigmaSwitch -> BlockSkip -> orig."""
+            if depth > 8:
+                return None
+            if not (hasattr(fwd, "__closure__") and fwd.__closure__):
+                return None
+            for cell in fwd.__closure__:
+                try:
+                    obj = cell.cell_contents
+                except ValueError:
+                    continue
+                if isinstance(obj, dict) and key in obj:
+                    return obj
+                if callable(obj):
+                    found = _find_state(obj, key, depth + 1)
+                    if found is not None:
+                        return found
+            return None
+
+        def _print_log(log):
+            if not log:
+                return
+            print(f"\n[SP Ricci Sentinel] Generation summary ({len(log)} steps):")
+            print(f"  {'Step':>4s}  {'e_mag':>7s}  {'regime':6s}  "
+                  f"{'win[0]':>6s}  {'win[4]':>6s}  {'roll_sim[0]':>11s}")
+            print("  " + "-" * 54)
+            last_regime = None
+            switch_step = None
+            for rec in log:
+                regime = "HIGH" if rec['high'] else "LOW "
+                if last_regime is not None and regime != last_regime:
+                    switch_step = rec['step']
+                    arrow = "HIGH->LOW" if last_regime == "HIGH" else "LOW->HIGH"
+                    print(f"  {'':4s}  {'--- ' + arrow + ' ---':>40s}")
+                rs0 = f"{rec['roll_sim0']:.3f}" if rec['roll_sim0'] is not None else "   n/a"
+                print(f"  {rec['step']:4d}  {rec['e_mag']:7.3f}  {regime:6s}  "
+                      f"{rec['win0']:6d}  {rec['win4']:6d}  {rs0:>11s}")
+                last_regime = regime
+            if switch_step is not None:
+                print(f"\n  Regime switch at step {switch_step} "
+                      f"(split@{sentinel['split']:.0%} of e_mag range)")
+            else:
+                print(f"\n  No regime switch (all steps in one regime)")
+            print()
+
+        blk0     = blocks[0][1]
+        orig_fwd = blk0.forward   # may be SigmaSwitch wrapper (which wraps BlockSkip)
+
+        def sentinel_forward(x, e, freqs, context, context_img_len=257,
+                             transformer_options={}):
+            now   = _time.time()
+            t_gap = now - sentinel['last_t'][0]
+
+            # ── Generation boundary: dump log and reset ────────────────────────
+            if sentinel['last_t'][0] > 0 and t_gap > 5.0:
+                _print_log(sentinel['log'])
+                sentinel['log'].clear()
+                sentinel['e_mag_max'][0] = None
+                sentinel['e_mag_min'][0] = None
+
+            sentinel['last_t'][0] = now
+
+            # ── Read current e_mag ─────────────────────────────────────────────
+            e_mag = float(e.float().reshape(-1).abs().mean())
+
+            # Update rolling range
+            if sentinel['e_mag_max'][0] is None:
+                sentinel['e_mag_max'][0] = e_mag
+                sentinel['e_mag_min'][0] = e_mag
+            else:
+                sentinel['e_mag_max'][0] = max(sentinel['e_mag_max'][0], e_mag)
+                sentinel['e_mag_min'][0] = min(sentinel['e_mag_min'][0], e_mag)
+
+            e_max     = sentinel['e_mag_max'][0]
+            e_min     = sentinel['e_mag_min'][0]
+            threshold = e_min + sentinel['split'] * max(e_max - e_min, 1e-6)
+            is_high   = e_mag >= threshold
+
+            # ── Read BlockSkip state (effective_win, rolling_sim) ─────────────
+            # Walk the closure chain: sentinel_forward -> orig_fwd (SigmaSwitch or
+            # BlockSkip) -> nested closures until we find the 'effective_win' dict.
+            bs_state = _find_state(orig_fwd, "effective_win")
+            step_no  = len(sentinel['log']) + 1
+            win0     = bs_state['effective_win'].get(0, -1) if bs_state else -1
+            win4     = bs_state['effective_win'].get(4, -1) if bs_state else -1
+            rs0      = (bs_state['rolling_sim'].get(0) if bs_state else None)
+
+            rec = {
+                'step':      step_no,
+                'e_mag':     e_mag,
+                'high':      is_high,
+                'win0':      win0,
+                'win4':      win4,
+                'roll_sim0': rs0,
+            }
+            sentinel['log'].append(rec)
+
+            if verbose:
+                regime = "HIGH" if is_high else "LOW "
+                rs_str = f"sim={rs0:.3f}" if rs0 is not None else ""
+                print(f"[SP Ricci] step={step_no:3d}  e={e_mag:.3f}  "
+                      f"thr={threshold:.3f}  {regime}  "
+                      f"win[0]={win0}  win[4]={win4}  {rs_str}")
+
+            return orig_fwd(x, e, freqs, context,
+                            context_img_len=context_img_len,
+                            transformer_options=transformer_options)
+
+        blk0.forward = sentinel_forward
+
+        print(f"[SP Ricci Sentinel] attached to block-0 | "
+              f"split@{sigma_split_frac:.0%} | verbose={verbose}")
+        print(f"[SP Ricci Sentinel] timeline table printed at each generation boundary (t_gap>5s)")
+        print(f"[SP Ricci Sentinel] columns: step | e_mag | HIGH/LOW | win[0] | win[4] | roll_sim[0]")
+
+        return (patched,)
+
+
 NODE_CLASS_MAPPINGS = {
-    "ShannonPrimeWanCache":        ShannonPrimeWanCache,
-    "ShannonPrimeWanCacheStats":   ShannonPrimeWanCacheStats,
-    "ShannonPrimeWanCacheSqfree":  ShannonPrimeWanCacheSqfree,
-    "ShannonPrimeWanSelfExtract":  ShannonPrimeWanSelfExtract,
-    "ShannonPrimeWanBlockCache":   ShannonPrimeWanBlockCache,
-    "ShannonPrimeWanBlockSkip":    ShannonPrimeWanBlockSkip,
-    "ShannonPrimeWanCacheFlush":   ShannonPrimeWanCacheFlush,
-    "ShannonPrimeWanSigmaSwitch":  ShannonPrimeWanSigmaSwitch,
+    "ShannonPrimeWanCache":           ShannonPrimeWanCache,
+    "ShannonPrimeWanCacheStats":      ShannonPrimeWanCacheStats,
+    "ShannonPrimeWanCacheSqfree":     ShannonPrimeWanCacheSqfree,
+    "ShannonPrimeWanSelfExtract":     ShannonPrimeWanSelfExtract,
+    "ShannonPrimeWanBlockCache":      ShannonPrimeWanBlockCache,
+    "ShannonPrimeWanBlockSkip":       ShannonPrimeWanBlockSkip,
+    "ShannonPrimeWanCacheFlush":      ShannonPrimeWanCacheFlush,
+    "ShannonPrimeWanSigmaSwitch":     ShannonPrimeWanSigmaSwitch,
+    "ShannonPrimeWanRicciSentinel":   ShannonPrimeWanRicciSentinel,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ShannonPrimeWanCache":        "Shannon-Prime: Wan Cross-Attn Cache",
-    "ShannonPrimeWanCacheStats":   "Shannon-Prime: Cache Stats",
-    "ShannonPrimeWanCacheSqfree":  "Shannon-Prime: Wan Cross-Attn Cache (Sqfree)",
-    "ShannonPrimeWanSelfExtract":  "Shannon-Prime: Wan Self-Attn Extract (Phase 12)",
-    "ShannonPrimeWanBlockCache":   "Shannon-Prime: Wan Block-Tier Self-Attn Cache",
-    "ShannonPrimeWanBlockSkip":    "Shannon-Prime: Wan Block-Level Self-Attn Skip",
-    "ShannonPrimeWanCacheFlush":   "Shannon-Prime: Wan Block Cache Flush (before VAE)",
-    "ShannonPrimeWanSigmaSwitch":  "Shannon-Prime: Wan Sigma Switch (Phase 13)",
+    "ShannonPrimeWanCache":           "Shannon-Prime: Wan Cross-Attn Cache",
+    "ShannonPrimeWanCacheStats":      "Shannon-Prime: Cache Stats",
+    "ShannonPrimeWanCacheSqfree":     "Shannon-Prime: Wan Cross-Attn Cache (Sqfree)",
+    "ShannonPrimeWanSelfExtract":     "Shannon-Prime: Wan Self-Attn Extract (Phase 12)",
+    "ShannonPrimeWanBlockCache":      "Shannon-Prime: Wan Block-Tier Self-Attn Cache",
+    "ShannonPrimeWanBlockSkip":       "Shannon-Prime: Wan Block-Level Self-Attn Skip",
+    "ShannonPrimeWanCacheFlush":      "Shannon-Prime: Wan Block Cache Flush (before VAE)",
+    "ShannonPrimeWanSigmaSwitch":     "Shannon-Prime: Wan Sigma Switch (Phase 13)",
+    "ShannonPrimeWanRicciSentinel":   "Shannon-Prime: Wan Ricci Sentinel (Phase 13 diag)",
 }

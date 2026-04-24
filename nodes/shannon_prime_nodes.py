@@ -862,6 +862,14 @@ class ShannonPrimeWanBlockSkip:
                 "drift_threshold": ("FLOAT", {"default": 0.85, "min": 0.50, "max": 0.99,
                     "step": 0.01,
                     "tooltip": "Rolling cos_sim below this halves the cache window (Mertens Oracle)"}),
+                "x_drift_threshold": ("FLOAT", {"default": 0.15, "min": 0.01, "max": 1.0,
+                    "step": 0.01,
+                    "tooltip": (
+                        "Preemptive invalidation: if block input x drifts by more than this "
+                        "relative L2 distance, force a cache miss before the window expires. "
+                        "0.15 = conservative (tight), 0.30 = permissive (fast static shots). "
+                        "Tier-0 blocks (L00-L03) tolerate larger drift — their geometry is stable."
+                    )}),
                 "verbose": ("BOOLEAN", {"default": False}),
             },
         }
@@ -871,7 +879,7 @@ class ShannonPrimeWanBlockSkip:
         return float("nan")
 
     def patch(self, model, tier_0_window=10, tier_1_window=3,
-              drift_threshold=0.85, verbose=False):
+              drift_threshold=0.85, x_drift_threshold=0.15, verbose=False):
         import types
         import comfy.model_management
 
@@ -910,6 +918,8 @@ class ShannonPrimeWanBlockSkip:
             'step_cached':    {},       # block_idx -> step at which y was cached
             'rolling_sim':    {},       # block_idx -> float (recent cos_sim)
             'effective_win':  {},       # block_idx -> current effective window
+            'x_ref':          {},       # block_idx -> x tensor at last cache miss (CPU)
+            'x_drift_thr':    x_drift_threshold,
         }
         for i, _ in blocks:
             w = get_window(i)
@@ -921,6 +931,15 @@ class ShannonPrimeWanBlockSkip:
             b_f = b.float().reshape(-1)
             n   = (a_f.norm() * b_f.norm()).clamp(min=1e-10)
             return float((a_f * b_f).sum() / n)
+
+        def _x_rel_drift(x_cur, x_ref_cpu):
+            """Relative L2 drift of block input x vs stored reference.
+            Cheap: single norm computation over flattened tensor.
+            Returns float in [0, 2]. 0=identical, ~1.4=orthogonal."""
+            x_ref = x_ref_cpu.to(device=x_cur.device, dtype=x_cur.dtype)
+            diff  = x_cur.float() - x_ref.float()
+            ref_n = x_ref.float().norm().clamp(min=1e-10)
+            return float(diff.norm() / ref_n)
 
         def make_patched_forward(orig_forward, block_idx, blk):
             window = get_window(block_idx)
@@ -946,7 +965,30 @@ class ShannonPrimeWanBlockSkip:
                 cached_s = state['step_cached'].get(block_idx, -999)
                 age      = step - cached_s
 
-                if eff_win > 0 and age < eff_win and block_idx in state['attn_cache']:
+                # ── Mertens Oracle: preemptive x_drift check ────────────────
+                # Before trusting the window, verify the block's INPUT hasn't
+                # drifted past the threshold since we last cached.
+                # This catches sudden scene changes (cuts, fast motion) before
+                # the rolling cosine similarity detects them.
+                x_drift_forced_miss = False
+                if (eff_win > 0 and age > 0
+                        and block_idx in state['x_ref']
+                        and block_idx in state['attn_cache']):
+                    x_dr = _x_rel_drift(x, state['x_ref'][block_idx])
+                    if x_dr > state['x_drift_thr']:
+                        x_drift_forced_miss = True
+                        # Also tighten the effective window
+                        state['effective_win'][block_idx] = max(1, eff_win // 2)
+                        if verbose:
+                            print(f"[SP BlockSkip] B{block_idx:02d} x-DRIFT "
+                                  f"step={step} drift={x_dr:.3f}>{state['x_drift_thr']:.2f}"
+                                  f" → forced miss, win halved to "
+                                  f"{state['effective_win'][block_idx]}")
+
+                if (not x_drift_forced_miss
+                        and eff_win > 0
+                        and age < eff_win
+                        and block_idx in state['attn_cache']):
                     # ── CACHE HIT ─────────────────────────────────────────────
                     y = state['attn_cache'][block_idx].to(device=x.device,
                                                           dtype=x.dtype)
@@ -989,9 +1031,10 @@ class ShannonPrimeWanBlockSkip:
                                   f"roll={state['rolling_sim'][block_idx]:.3f} "
                                   f"win={state['effective_win'][block_idx]}")
 
-                    # Cache the pre-gate attention output on CPU
+                    # Cache the pre-gate attention output + block input reference
                     state['attn_cache'][block_idx]   = y.detach().cpu()
                     state['step_cached'][block_idx]  = step
+                    state['x_ref'][block_idx]        = x.detach().cpu()
 
                     x = torch.addcmul(x, y, repeat_e(e_mods[2], x))
                     del y

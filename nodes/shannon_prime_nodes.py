@@ -1274,6 +1274,152 @@ class ShannonPrimeWanCacheFlush:
         return (samples,)
 
 
+class ShannonPrimeWanSigmaSwitch:
+    """
+    Phase 13 — Sigma-aware cache window adaptation for Wan DiT blocks.
+
+    The sigma schedule in diffusion is the direct analog of the L/2 phase
+    transition in LLMs. At high sigma (early steps, Arithmetic Granite), the
+    model establishes global composition and the early blocks are maximally
+    stable — we can cache aggressively. At low sigma (late steps, Semantic
+    Sand), the model refines textures and the blocks drift faster — we cache
+    conservatively.
+
+    This node wraps BlockSkip's existing state and adjusts effective_win
+    dynamically at each block-0 call based on the current e_mag (timestep
+    embedding magnitude, which encodes sigma). It reads and modifies the
+    shared state dict captured by BlockSkip's closures.
+
+    Mechanism:
+      - Tracks rolling e_mag max and min across the generation.
+      - Above threshold (high sigma): effective_win *= high_mult (more caching)
+      - Below threshold (low sigma):  effective_win *= low_mult  (less caching)
+      - The switch point is sigma_split_frac of the [min, max] e_mag range.
+
+    Phase 12 data supports this:
+      - Sigma sweep showed blocks L00-L03 cos_sim > 0.95 at steps 2-9 (high sigma)
+        but dropping to 0.6-0.7 by steps 14-20 (low sigma).
+      - Wider windows are correct at high sigma, tighter at low sigma.
+
+    Workflow: UnetLoader → ShannonPrimeWanCache → ShannonPrimeWanBlockSkip
+              → ShannonPrimeWanSigmaSwitch → KSampler → CacheFlush → VAEDecode
+    """
+
+    CATEGORY     = "shannon-prime"
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION     = "attach"
+    DESCRIPTION  = (
+        "Phase 13: sigma-aware cache window adaptation for BlockSkip. "
+        "Expands windows at high sigma (Arithmetic Granite) and contracts "
+        "them at low sigma (Semantic Sand) for dynamic per-step compression."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {"model": ("MODEL",)},
+            "optional": {
+                "high_sigma_mult": ("FLOAT", {
+                    "default": 1.5, "min": 1.0, "max": 4.0, "step": 0.1,
+                    "tooltip": "Window multiplier at high sigma (Arithmetic Granite). "
+                               "1.5 = 50% longer cache window in early steps."}),
+                "low_sigma_mult": ("FLOAT", {
+                    "default": 0.5, "min": 0.1, "max": 1.0, "step": 0.1,
+                    "tooltip": "Window multiplier at low sigma (Semantic Sand). "
+                               "0.5 = half the cache window in late steps (more recompute)."}),
+                "sigma_split_frac": ("FLOAT", {
+                    "default": 0.5, "min": 0.1, "max": 0.9, "step": 0.05,
+                    "tooltip": "Fraction of the e_mag range at which to switch. "
+                               "0.5 = switch at midpoint between max and min e_mag."}),
+                "verbose": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    @classmethod
+    def IS_CHANGED(cls, *a, **k):
+        return float("nan")
+
+    def attach(self, model, high_sigma_mult=1.5, low_sigma_mult=0.5,
+               sigma_split_frac=0.5, verbose=False):
+        patched = model.clone()
+        blocks  = list(_iter_wan_blocks(patched))
+        if not blocks:
+            print("[SP SigmaSwitch] no Wan blocks found — passing through")
+            return (patched,)
+
+        # Shared sigma tracker (separate from BlockSkip state)
+        sigma_state = {
+            'e_mag_max': [None],   # rolling max e_mag seen in this generation
+            'e_mag_min': [None],   # rolling min e_mag seen in this generation
+            'high_mult': high_sigma_mult,
+            'low_mult':  low_sigma_mult,
+            'split':     sigma_split_frac,
+        }
+
+        def make_sigma_hook(blk, block_idx):
+            """Wrap block-0 forward to adjust BlockSkip windows based on sigma."""
+            orig_forward = blk.forward
+
+            def sigma_forward(x, e, freqs, context, context_img_len=257,
+                              transformer_options={}):
+                if block_idx == 0:
+                    # Read current e_mag
+                    e_flat  = e.float().reshape(-1)
+                    e_mag   = float(e_flat.abs().mean())
+
+                    # Update rolling max/min
+                    if sigma_state['e_mag_max'][0] is None:
+                        sigma_state['e_mag_max'][0] = e_mag
+                        sigma_state['e_mag_min'][0] = e_mag
+                    else:
+                        sigma_state['e_mag_max'][0] = max(sigma_state['e_mag_max'][0], e_mag)
+                        sigma_state['e_mag_min'][0] = min(sigma_state['e_mag_min'][0], e_mag)
+
+                    e_max = sigma_state['e_mag_max'][0]
+                    e_min = sigma_state['e_mag_min'][0]
+                    e_range = max(e_max - e_min, 1e-6)
+                    threshold = e_min + sigma_state['split'] * e_range
+                    is_high_sigma = e_mag >= threshold
+
+                    # Find and adjust BlockSkip state's effective_win
+                    fwd = orig_forward  # may itself be a BlockSkip closure
+                    cell_contents = []
+                    if hasattr(fwd, "__closure__") and fwd.__closure__:
+                        cell_contents = [c.cell_contents for c in fwd.__closure__
+                                         if hasattr(c, "cell_contents")]
+                    for obj in cell_contents:
+                        if isinstance(obj, dict) and "effective_win" in obj:
+                            mult = sigma_state['high_mult'] if is_high_sigma else sigma_state['low_mult']
+                            for blk_i, nom_win in list(obj["effective_win"].items()):
+                                # Re-derive the nominal window from the tier
+                                nom = 10 if blk_i < 4 else (3 if blk_i < 9 else 0)
+                                if nom > 0:
+                                    new_win = max(1, min(nom * 3,  # hard cap at 3× nominal
+                                                         int(nom * mult)))
+                                    obj["effective_win"][blk_i] = new_win
+                            if verbose:
+                                mode = "HIGH-sigma" if is_high_sigma else "LOW-sigma"
+                                sample_win = obj["effective_win"].get(0, "?")
+                                print(f"[SP SigmaSwitch] {mode} e={e_mag:.3f} "
+                                      f"thresh={threshold:.3f} win[0]={sample_win}")
+
+                return orig_forward(x, e, freqs, context,
+                                    context_img_len=context_img_len,
+                                    transformer_options=transformer_options)
+
+            return sigma_forward
+
+        # Only need to hook block 0 (block-0 drives the sigma tracking)
+        blk0 = blocks[0][1]
+        blk0.forward = make_sigma_hook(blk0, 0)
+
+        print(f"[SP SigmaSwitch] attached to block-0 | "
+              f"high_sigma_mult={high_sigma_mult}x low_sigma_mult={low_sigma_mult}x "
+              f"split@{sigma_split_frac:.0%} of e_mag range")
+
+        return (patched,)
+
+
 NODE_CLASS_MAPPINGS = {
     "ShannonPrimeWanCache":        ShannonPrimeWanCache,
     "ShannonPrimeWanCacheStats":   ShannonPrimeWanCacheStats,
@@ -1282,14 +1428,16 @@ NODE_CLASS_MAPPINGS = {
     "ShannonPrimeWanBlockCache":   ShannonPrimeWanBlockCache,
     "ShannonPrimeWanBlockSkip":    ShannonPrimeWanBlockSkip,
     "ShannonPrimeWanCacheFlush":   ShannonPrimeWanCacheFlush,
+    "ShannonPrimeWanSigmaSwitch":  ShannonPrimeWanSigmaSwitch,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ShannonPrimeWanCache":       "Shannon-Prime: Wan Cross-Attn Cache",
-    "ShannonPrimeWanCacheStats":  "Shannon-Prime: Cache Stats",
-    "ShannonPrimeWanCacheSqfree": "Shannon-Prime: Wan Cross-Attn Cache (Sqfree)",
-    "ShannonPrimeWanSelfExtract": "Shannon-Prime: Wan Self-Attn Extract (Phase 12)",
-    "ShannonPrimeWanBlockCache":  "Shannon-Prime: Wan Block-Tier Self-Attn Cache",
-    "ShannonPrimeWanBlockSkip":   "Shannon-Prime: Wan Block-Level Self-Attn Skip",
-    "ShannonPrimeWanCacheFlush":  "Shannon-Prime: Wan Block Cache Flush (before VAE)",
+    "ShannonPrimeWanCache":        "Shannon-Prime: Wan Cross-Attn Cache",
+    "ShannonPrimeWanCacheStats":   "Shannon-Prime: Cache Stats",
+    "ShannonPrimeWanCacheSqfree":  "Shannon-Prime: Wan Cross-Attn Cache (Sqfree)",
+    "ShannonPrimeWanSelfExtract":  "Shannon-Prime: Wan Self-Attn Extract (Phase 12)",
+    "ShannonPrimeWanBlockCache":   "Shannon-Prime: Wan Block-Tier Self-Attn Cache",
+    "ShannonPrimeWanBlockSkip":    "Shannon-Prime: Wan Block-Level Self-Attn Skip",
+    "ShannonPrimeWanCacheFlush":   "Shannon-Prime: Wan Block Cache Flush (before VAE)",
+    "ShannonPrimeWanSigmaSwitch":  "Shannon-Prime: Wan Sigma Switch (Phase 13)",
 }

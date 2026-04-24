@@ -642,6 +642,7 @@ class ShannonPrimeWanBlockSkip:
                         _obj = _cell.cell_contents
                         if isinstance(_obj, dict) and "attn_cache" in _obj:
                             _obj["attn_cache"].clear()
+                            _obj.get("xattn_cache", {}).clear()
                             _obj.get("step_cached", {}).clear()
                             _obj.get("hit_streak", {}).clear()
                             _cleared += 1
@@ -666,8 +667,9 @@ class ShannonPrimeWanBlockSkip:
         state = {
             'global_step':    [0],      # step counter (incremented by block-0)
             'hit_streak':     {},       # block_idx -> consecutive cache-hit count
-            'attn_cache':     {},       # block_idx -> y tensor (CPU fp16)
-            'step_cached':    {},       # block_idx -> step at which y was cached
+            'attn_cache':     {},       # block_idx -> self-attn y tensor (CPU fp16)
+            'xattn_cache':    {},       # block_idx -> cross-attn output tensor (CPU fp16)
+            'step_cached':    {},       # block_idx -> step at which caches were filled
         }
 
         def make_patched_forward(orig_forward, block_idx, blk):
@@ -708,31 +710,45 @@ class ShannonPrimeWanBlockSkip:
                 age = step - cached_s
                 streak = state['hit_streak'].get(block_idx, 0)
                 cached_y = state['attn_cache'].get(block_idx)
+                cached_xa = state['xattn_cache'].get(block_idx)
 
-                # Shape validation
+                # Shape validation — invalidate both caches together
                 shape_ok = (cached_y is not None
                             and cached_y.shape[0] == x.shape[0]
                             and cached_y.shape[1] == x.shape[1])
                 if not shape_ok and cached_y is not None:
-                    del state['attn_cache'][block_idx]
+                    state['attn_cache'].pop(block_idx, None)
+                    state['xattn_cache'].pop(block_idx, None)
                     state['step_cached'].pop(block_idx, None)
                     cached_y = None
+                    cached_xa = None
 
-                # ── CACHE HIT: within window, not streak-forced-miss ────────
-                if (cached_y is not None
-                        and age >= 0 and age < window
-                        and streak < _streak_limit):
-                    # CPU fp16 → GPU: ~40MB at ~12 GB/s PCIe = ~3ms. Negligible.
+                # ── CACHE HIT: skip BOTH self-attn AND cross-attn ──────────
+                hit = (cached_y is not None
+                       and cached_xa is not None
+                       and age >= 0 and age < window
+                       and streak < _streak_limit)
+
+                if hit:
+                    # Self-attn: cached pre-gate y + current step's gate
                     y = cached_y.to(device=x.device, dtype=x.dtype)
                     x = torch.addcmul(x.contiguous(), y,
                                       repeat_e(e_mods[2], x))
+                    del y
+
+                    # Cross-attn: cached output is a plain residual add
+                    xa = cached_xa.to(device=x.device, dtype=x.dtype)
+                    x = x + xa
+                    del xa
+
                     state['hit_streak'][block_idx] = streak + 1
                     if verbose:
                         print(f"[SP BlockSkip] B{block_idx:02d} HIT  "
                               f"step={step} age={age}/{window} "
-                              f"streak={streak+1}/{_streak_limit} CPU/fp16")
+                              f"streak={streak+1}/{_streak_limit} "
+                              f"self+cross CPU/fp16")
                 else:
-                    # ── CACHE MISS: run self-attention ─────────────────────────
+                    # ── CACHE MISS: run self-attention ────────────────────────
                     x = x.contiguous()
                     y = blk.self_attn(
                         torch.addcmul(repeat_e(e_mods[0], x),
@@ -740,32 +756,35 @@ class ShannonPrimeWanBlockSkip:
                                       1 + repeat_e(e_mods[1], x)),
                         freqs, transformer_options=transformer_options
                     )
-
-                    # Store y on CPU fp16 — zero GPU memory pressure.
-                    # ~40MB per block, 9 blocks = ~360MB CPU. Transfer on hit
-                    # is ~3ms/block via PCIe — invisible against step time.
                     state['attn_cache'][block_idx] = y.detach().cpu()
-                    state['step_cached'][block_idx] = step
-                    state['hit_streak'][block_idx] = 0
-
-                    if verbose:
-                        print(f"[SP BlockSkip] B{block_idx:02d} MISS "
-                              f"step={step} CPU/fp16")
 
                     x = torch.addcmul(x, y, repeat_e(e_mods[2], x))
                     del y
 
-                # ── Cross-attention + FFN (always fresh) ─────────────────────
-                x = x + blk.cross_attn(
-                    blk.norm3(x), context,
-                    context_img_len=context_img_len,
-                    transformer_options=transformer_options
-                )
+                    # ── CACHE MISS: run cross-attention ──────────────────────
+                    xa = blk.cross_attn(
+                        blk.norm3(x), context,
+                        context_img_len=context_img_len,
+                        transformer_options=transformer_options
+                    )
+                    state['xattn_cache'][block_idx] = xa.detach().cpu()
+                    state['step_cached'][block_idx] = step
+                    state['hit_streak'][block_idx] = 0
+
+                    x = x + xa
+                    del xa
+
+                    if verbose:
+                        print(f"[SP BlockSkip] B{block_idx:02d} MISS "
+                              f"step={step} self+cross CPU/fp16")
+
+                # ── attn2 patches (ControlNet etc) — always run ─────────────
                 patches = transformer_options.get("patches", {})
                 if "attn2_patch" in patches:
                     for p in patches["attn2_patch"]:
                         x = p({"x": x, "transformer_options": transformer_options})
 
+                # ── FFN (always fresh) ───────────────────────────────────────
                 y = blk.ffn(torch.addcmul(repeat_e(e_mods[3], x),
                                           blk.norm2(x),
                                           1 + repeat_e(e_mods[4], x)))
@@ -785,12 +804,11 @@ class ShannonPrimeWanBlockSkip:
 
         tier0 = [i for i, _ in blocks if i < 4]
         tier1 = [i for i, _ in blocks if 4 <= i < 9]
-        print(f"[SP BlockSkip] Phase 15 LEAN — patched {n_patched}/{n_blocks} blocks")
-        print(f"[SP BlockSkip] ALL CPU/fp16 (lowvram-safe, no GPU memory pinned)")
+        print(f"[SP BlockSkip] Phase 15 ALL THE WAY — patched {n_patched}/{n_blocks} blocks")
+        print(f"[SP BlockSkip] Self-attn + cross-attn BOTH cached, CPU/fp16")
         print(f"[SP BlockSkip] Tier-0 win={tier_0_window}: {tier0}")
         print(f"[SP BlockSkip] Tier-1 win={tier_1_window}: {tier1}")
-        print(f"[SP BlockSkip] Streak limits: tier-0=10, tier-1=5")
-        print(f"[SP BlockSkip] Zero overhead: no oracle, no x_drift, no cos_sim")
+        print(f"[SP BlockSkip] On HIT: only adaLN + FFN run. Self-attn + cross-attn SKIPPED.")
 
         return (patched,)
 
@@ -847,8 +865,9 @@ class ShannonPrimeWanCacheFlush:
                     except ValueError:
                         continue
                     if isinstance(obj, dict) and "attn_cache" in obj:
-                        n = len(obj["attn_cache"])
+                        n = len(obj["attn_cache"]) + len(obj.get("xattn_cache", {}))
                         obj["attn_cache"].clear()
+                        obj.get("xattn_cache", {}).clear()
                         obj.get("step_cached", {}).clear()
                         obj.get("hit_streak", {}).clear()
                         if n > 0:

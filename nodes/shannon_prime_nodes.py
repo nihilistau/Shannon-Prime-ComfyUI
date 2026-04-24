@@ -361,10 +361,206 @@ class ShannonPrimeWanCacheSqfree:
         return (patched,)
 
 
+class ShannonPrimeWanSelfExtract:
+    """
+    Phase 12 diagnostic: captures Wan self-attention K vectors during denoising.
+
+    Hooks into `blk.self_attn.k` for every WanAttentionBlock and captures
+    the K projection output at the specified denoising step (0 = first/noisiest,
+    mid = structural regime, late = texture regime).
+
+    Output saved as .npz compatible with sp_diagnostics.py:
+        k_vectors shape: (n_blocks, n_kv_heads, n_tokens, head_dim)
+
+    Usage after running:
+        python sp_diagnostics.py --input wan_self_attn.npz --sqfree --layer-period 4
+
+    Connect BEFORE the sampler. The MODEL output is the same model — this node
+    is an observer, not a patcher. The .npz is written once the target step
+    fires, then hooks are removed automatically.
+    """
+
+    CATEGORY = "shannon-prime/diagnostics"
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "attach"
+    DESCRIPTION = ("Captures Wan self-attention K vectors at a target denoising step "
+                   "and saves them as .npz for sp_diagnostics Phase 12 analysis.")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+            },
+            "optional": {
+                "capture_step": ("INT", {
+                    "default": 25, "min": 0, "max": 200,
+                    "tooltip": "Denoising step at which to capture K (0=first/highest-sigma)"}),
+                "max_tokens": ("INT", {
+                    "default": 256, "min": 64, "max": 4096,
+                    "tooltip": "Max token positions to store per block (caps memory)"}),
+                "output_dir": ("STRING", {
+                    "default": "",
+                    "tooltip": "Directory for .npz output (default: ComfyUI output/shannon_prime/)"}),
+            },
+        }
+
+    @classmethod
+    def IS_CHANGED(cls, *a, **k):
+        return float("nan")
+
+    def attach(self, model, capture_step=25, max_tokens=256, output_dir=""):
+        import folder_paths as _fp
+        import numpy as np, json, time
+
+        if not output_dir:
+            output_dir = os.path.join(_fp.get_output_directory(), "shannon_prime")
+        os.makedirs(output_dir, exist_ok=True)
+        out_path = os.path.join(output_dir, f"wan_self_attn_step{capture_step}.npz")
+
+        patched = model.clone()
+        blocks  = list(_iter_wan_blocks(patched))
+        if not blocks:
+            print("[SP SelfExtract] no Wan blocks found — passing through")
+            return (patched,)
+
+        n_blocks  = len(blocks)
+        head_dim  = blocks[0][1].self_attn.head_dim
+
+        # Shared mutable state across hooks (dict avoids closure rebind issues)
+        state = {
+            "step":      0,         # counts how many times block-0's K fired
+            "captured":  {},        # block_idx -> torch.Tensor (n_kv_heads, T, head_dim)
+            "target":    capture_step,
+            "done":      False,
+            "handles":   [],
+            "max_tok":   max_tokens,
+            "head_dim":  head_dim,
+        }
+
+        def make_hook(block_idx):
+            def _hook(module, _inp, output):
+                if state["done"]:
+                    return
+                # Count steps via block 0 as the "clock" block
+                if block_idx == 0:
+                    state["step"] += 1
+
+                if state["step"] - 1 == state["target"]:
+                    # output: (batch*tokens, n_kv_heads*head_dim)  or
+                    #         (batch, tokens, n_kv_heads*head_dim)
+                    k = output.detach().cpu().float()
+                    if k.dim() == 2:
+                        # (B*T, D) — reshape; we don't know B, assume B=1
+                        k = k.unsqueeze(0)          # (1, B*T, D)
+                    # k: (B, T, D)  where D = n_kv_heads * head_dim
+                    T  = k.shape[1]
+                    D  = k.shape[2]
+                    hd = state["head_dim"]
+                    n_kv = max(1, D // hd) if hd > 0 else 1
+
+                    k = k[0]                         # (T, D) — take first batch
+                    T_cap = min(T, state["max_tok"])
+                    k = k[:T_cap]                    # (T_cap, D)
+                    k = k.reshape(T_cap, n_kv, hd)  # (T_cap, n_kv, hd)
+                    k = k.permute(1, 0, 2)           # (n_kv, T_cap, hd)
+                    state["captured"][block_idx] = k
+
+                # After capturing all blocks at the target step, save
+                if (state["step"] - 1 == state["target"]
+                        and block_idx == n_blocks - 1
+                        and not state["done"]):
+                    state["done"] = True
+                    _save(state, out_path, n_blocks, capture_step, head_dim)
+                    for h in state["handles"]:
+                        h.remove()
+                    state["handles"].clear()
+            return _hook
+
+        # Attach hooks to blk.self_attn.k (try common names)
+        n_hooked = 0
+        for i, blk in blocks:
+            sa = getattr(blk, "self_attn", None)
+            if sa is None:
+                continue
+            k_lin = None
+            for attr in ("k", "k_proj", "to_k", "wk", "key"):
+                candidate = getattr(sa, attr, None)
+                if isinstance(candidate, nn.Module):
+                    k_lin = candidate
+                    break
+            if k_lin is None:
+                continue
+            h = k_lin.register_forward_hook(make_hook(i))
+            state["handles"].append(h)
+            n_hooked += 1
+
+        print(f"[SP SelfExtract] hooked {n_hooked}/{n_blocks} self-attn K projections "
+              f"(head_dim={head_dim}, capture_step={capture_step}, "
+              f"max_tokens={max_tokens})")
+        print(f"[SP SelfExtract] will save to: {out_path}")
+
+        return (patched,)
+
+
+def _save(state, out_path, n_blocks, capture_step, head_dim):
+    """Assemble captured K dicts → (n_blocks, n_kv_heads, T, hd) .npz."""
+    import numpy as np, json
+
+    captured = state["captured"]
+    if not captured:
+        print("[SP SelfExtract] Nothing captured — did the generation complete?")
+        return
+
+    # Find common n_kv_heads and T from first block
+    sample = next(iter(captured.values()))   # (n_kv, T, hd)
+    n_kv_heads = sample.shape[0]
+    T_cap      = sample.shape[1]
+
+    k_arr = torch.zeros(n_blocks, n_kv_heads, T_cap, head_dim)
+    for idx, k in captured.items():
+        # k: (n_kv, T_cap, hd) — pad if mismatched (safety)
+        nk = min(k.shape[0], n_kv_heads)
+        nt = min(k.shape[1], T_cap)
+        k_arr[idx, :nk, :nt, :] = k[:nk, :nt, :]
+
+    k_np = k_arr.numpy().astype("float32")
+
+    meta = {
+        "source":        "wan_self_attention",
+        "capture_step":  capture_step,
+        "n_blocks":      n_blocks,
+        "n_kv_heads":    n_kv_heads,
+        "n_tokens":      T_cap,
+        "head_dim":      head_dim,
+        "note": ("Wan DiT self-attention K vectors. "
+                 "Axis 0 = DiT block (analogous to 'layer'), "
+                 "Axis 1 = KV heads, Axis 2 = token positions, Axis 3 = head_dim. "
+                 "Run: sp_diagnostics.py --input <this_file> --sqfree --layer-period 4"),
+    }
+
+    import numpy as np
+    np.savez_compressed(out_path,
+                        k_vectors=k_np,
+                        metadata=np.array(json.dumps(meta)))
+
+    print(f"[SP SelfExtract] saved {k_np.shape} K vectors -> {out_path}")
+    print(f"[SP SelfExtract] Next: python sp_diagnostics.py "
+          f"--input {out_path} --sqfree --layer-period 4 --global-offset 3")
+
+
 NODE_CLASS_MAPPINGS = {
-    "ShannonPrimeWanCache": ShannonPrimeWanCache,
-    "ShannonPrimeWanCacheStats": ShannonPrimeWanCacheStats,
-    "ShannonPrimeWanCacheSqfree": ShannonPrimeWanCacheSqfree,
+    "ShannonPrimeWanCache":        ShannonPrimeWanCache,
+    "ShannonPrimeWanCacheStats":   ShannonPrimeWanCacheStats,
+    "ShannonPrimeWanCacheSqfree":  ShannonPrimeWanCacheSqfree,
+    "ShannonPrimeWanSelfExtract":  ShannonPrimeWanSelfExtract,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "ShannonPrimeWanCache":       "Shannon-Prime: Wan Cross-Attn Cache",
+    "ShannonPrimeWanCacheStats":  "Shannon-Prime: Cache Stats",
+    "ShannonPrimeWanCacheSqfree": "Shannon-Prime: Wan Cross-Attn Cache (Sqfree)",
+    "ShannonPrimeWanSelfExtract": "Shannon-Prime: Wan Self-Attn Extract (Phase 12)",
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ShannonPrimeWanCache": "Shannon-Prime Wan Cache",

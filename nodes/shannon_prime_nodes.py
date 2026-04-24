@@ -1066,6 +1066,12 @@ class ShannonPrimeWanBlockSkip:
                     state['last_e_mag'][0]    = e_mag
                     state['last_gen_step'][0] = step
 
+                # ── Print actual run settings on step 1 (what's really running) ──
+                if block_idx == 0 and step == 1:
+                    _t = x.shape[1]   # total latent tokens
+                    print(f"[SP BlockSkip] step=1 x.shape={tuple(x.shape)}  "
+                          f"tokens={_t}  dtype={x.dtype}  device={x.device}")
+
                 # ── Recompute adaLN modulation (always — cheap) ─────────────
                 cast = comfy.model_management.cast_to
                 if e.ndim < 4:

@@ -862,13 +862,20 @@ class ShannonPrimeWanBlockSkip:
                 "drift_threshold": ("FLOAT", {"default": 0.85, "min": 0.50, "max": 0.99,
                     "step": 0.01,
                     "tooltip": "Rolling cos_sim below this halves the cache window (Mertens Oracle)"}),
-                "x_drift_threshold": ("FLOAT", {"default": 0.15, "min": 0.01, "max": 1.0,
-                    "step": 0.01,
+                "x_drift_t0": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0,
+                    "step": 0.05,
                     "tooltip": (
-                        "Preemptive invalidation: if block input x drifts by more than this "
-                        "relative L2 distance, force a cache miss before the window expires. "
-                        "0.15 = conservative (tight), 0.30 = permissive (fast static shots). "
-                        "Tier-0 blocks (L00-L03) tolerate larger drift — their geometry is stable."
+                        "x-drift threshold for Tier-0 blocks (L00-L03, Permanent Granite). "
+                        "Default 0.0 = DISABLED (trust the rolling-sim oracle alone — "
+                        "these blocks are stable and the oracle handles them correctly). "
+                        "Raise to 0.30-0.40 only if you see video composition instability."
+                    )}),
+                "x_drift_t1": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0,
+                    "step": 0.05,
+                    "tooltip": (
+                        "x-drift threshold for Tier-1 blocks (L04-L08, Stable Sand). "
+                        "0.25 matches Wan's per-step latent change envelope. "
+                        "Lower = tighter (more recomputes), higher = more aggressive caching."
                     )}),
                 "verbose": ("BOOLEAN", {"default": False}),
             },
@@ -879,7 +886,9 @@ class ShannonPrimeWanBlockSkip:
         return float("nan")
 
     def patch(self, model, tier_0_window=10, tier_1_window=3,
-              drift_threshold=0.85, x_drift_threshold=0.15, verbose=False):
+              drift_threshold=0.85,
+              x_drift_t0=0.0, x_drift_t1=0.25,
+              verbose=False):
         import types
         import comfy.model_management
 
@@ -918,8 +927,10 @@ class ShannonPrimeWanBlockSkip:
             'step_cached':    {},       # block_idx -> step at which y was cached
             'rolling_sim':    {},       # block_idx -> float (recent cos_sim)
             'effective_win':  {},       # block_idx -> current effective window
-            'x_ref':          {},       # block_idx -> x tensor at last cache miss (CPU)
-            'x_drift_thr':    x_drift_threshold,
+            'x_ref':      {},   # block_idx -> x tensor at last cache miss (CPU)
+            # Per-tier x_drift thresholds (0.0 = disabled)
+            'x_drift_t0': x_drift_t0,   # Tier-0 (L00-L03): default disabled
+            'x_drift_t1': x_drift_t1,   # Tier-1 (L04-L08): default 0.25
         }
         for i, _ in blocks:
             w = get_window(i)
@@ -966,22 +977,23 @@ class ShannonPrimeWanBlockSkip:
                 age      = step - cached_s
 
                 # ── Mertens Oracle: preemptive x_drift check ────────────────
-                # Before trusting the window, verify the block's INPUT hasn't
-                # drifted past the threshold since we last cached.
-                # This catches sudden scene changes (cuts, fast motion) before
-                # the rolling cosine similarity detects them.
+                # Tier-0 (L00-L03): DISABLED by default (x_drift_t0=0.0)
+                #   The rolling oracle handles these correctly; x_drift would
+                #   over-trigger on Wan's aggressive noise schedule.
+                # Tier-1 (L04-L08): x_drift_t1=0.25 catches scene changes
+                #   before the slower rolling oracle detects them.
                 x_drift_forced_miss = False
-                if (eff_win > 0 and age > 0
+                x_drift_thr = state['x_drift_t0'] if block_idx < 4 else state['x_drift_t1']
+                if (x_drift_thr > 0.0 and eff_win > 0 and age > 0
                         and block_idx in state['x_ref']
                         and block_idx in state['attn_cache']):
                     x_dr = _x_rel_drift(x, state['x_ref'][block_idx])
-                    if x_dr > state['x_drift_thr']:
+                    if x_dr > x_drift_thr:
                         x_drift_forced_miss = True
-                        # Also tighten the effective window
                         state['effective_win'][block_idx] = max(1, eff_win // 2)
                         if verbose:
                             print(f"[SP BlockSkip] B{block_idx:02d} x-DRIFT "
-                                  f"step={step} drift={x_dr:.3f}>{state['x_drift_thr']:.2f}"
+                                  f"step={step} drift={x_dr:.3f}>{x_drift_thr:.2f}"
                                   f" -> forced miss, win halved to "
                                   f"{state['effective_win'][block_idx]}")
 
@@ -1073,6 +1085,8 @@ class ShannonPrimeWanBlockSkip:
         print(f"[SP BlockSkip] Tier-0 win={tier_0_window}: blocks {tier0}")
         print(f"[SP BlockSkip] Tier-1 win={tier_1_window}: blocks {tier1}")
         print(f"[SP BlockSkip] Mertens Oracle drift_threshold={drift_threshold:.2f}")
+        print(f"[SP BlockSkip] x-drift: T0={'disabled' if x_drift_t0==0.0 else x_drift_t0} "
+              f"T1={x_drift_t1}  (0.0=disabled, trust oracle)")
         print(f"[SP BlockSkip] Savings: self-attn Q+K+V+scores skipped on cache hits "
               f"(~50% compute for patched blocks)")
 

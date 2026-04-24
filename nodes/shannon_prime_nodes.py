@@ -605,8 +605,8 @@ class ShannonPrimeWanBlockSkip:
                     "tooltip": "Cache window for L16-L39 (Deep/late — texture detail). 0=disabled. YOLO: try 2 for SVI."}),
                 "cache_ffn": ("BOOLEAN", {"default": False,
                     "tooltip": "TURBO: also cache FFN output. Hit steps become near-zero compute. May affect quality on long schedules."}),
-                "cache_dtype": (["fp16", "fp8"], {"default": "fp16",
-                    "tooltip": "Cache storage dtype. fp8 halves CPU memory and PCIe transfer but clips values >448. Safe for short schedules."}),
+                "cache_dtype": (["fp16", "fp8", "mixed"], {"default": "fp16",
+                    "tooltip": "fp16=all caches fp16. fp8=all fp8. mixed=tier-0/1 fp16 (precision), tier-2/3 fp8 (saves memory where approximation is already aggressive)."}),
                 "verbose": ("BOOLEAN", {"default": False,
                     "tooltip": "Print per-block HIT/MISS logs to console"}),
             },
@@ -675,11 +675,21 @@ class ShannonPrimeWanBlockSkip:
             return tier_3_window
 
         _do_ffn = cache_ffn  # closure capture
-        _use_fp8 = (cache_dtype == "fp8")
-        if _use_fp8:
-            _store_dtype = torch.float8_e4m3fn
-        else:
-            _store_dtype = torch.float16
+        # Per-block dtype: mixed = fp16 for tier-0/1, fp8 for tier-2/3
+        _fp16 = torch.float16
+        _fp8 = torch.float8_e4m3fn
+        if cache_dtype == "fp8":
+            def _dtype_for(block_idx):
+                return _fp8
+            _use_fp8_any = True
+        elif cache_dtype == "mixed":
+            def _dtype_for(block_idx):
+                return _fp16 if block_idx < 9 else _fp8
+            _use_fp8_any = True
+        else:  # fp16
+            def _dtype_for(block_idx):
+                return _fp16
+            _use_fp8_any = False
 
         # Shared state across all patched blocks
         state = {
@@ -755,17 +765,18 @@ class ShannonPrimeWanBlockSkip:
                        and age >= 0 and age < window
                        and streak < _streak_limit)
 
-                # ── Helper: load cached tensor to GPU ──────────────────────
-                # fp8: cast to compute dtype on CPU first (safe software path),
-                # then transfer. Avoids combined device+dtype .to() hang on Turing.
+                # ── Helpers: store/load with per-block dtype ──────────────
+                _blk_dtype = _dtype_for(block_idx)
+                _is_fp8_blk = (_blk_dtype == _fp8)
+
                 def _load(t):
-                    if _use_fp8:
+                    # fp8: cast on CPU first (safe software path on Turing)
+                    if _is_fp8_blk:
                         return t.to(dtype=x.dtype).to(device=x.device)
                     return t.to(device=x.device, dtype=x.dtype)
 
-                # ── Helper: store tensor to CPU cache ──────────────────────
                 def _store(t):
-                    return t.detach().to(dtype=_store_dtype).cpu()
+                    return t.detach().to(dtype=_blk_dtype).cpu()
 
                 if hit:
                     # Self-attn: cached pre-gate y + current step's gate
@@ -858,8 +869,10 @@ class ShannonPrimeWanBlockSkip:
         tier2 = [i for i, _ in blocks if 9 <= i < 16 and get_window(i) > 0]
         tier3 = [i for i, _ in blocks if i >= 16 and get_window(i) > 0]
         mode = "TURBO" if cache_ffn else "self+cross"
-        dtype_str = "fp8" if _use_fp8 else "fp16"
+        dtype_str = cache_dtype  # "fp16", "fp8", or "mixed"
         print(f"[SP BlockSkip] Phase 15 FULL SEND — {n_patched}/{n_blocks} blocks, {mode}, {dtype_str}")
+        if cache_dtype == "mixed":
+            print(f"[SP BlockSkip] Mixed dtype: tier-0/1 fp16 (blocks <9), tier-2/3 fp8 (blocks >=9)")
         if tier0:
             print(f"[SP BlockSkip] Tier-0 win={tier_0_window} streak=10: {tier0}")
         if tier1:

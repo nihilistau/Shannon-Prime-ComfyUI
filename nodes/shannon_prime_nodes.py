@@ -809,12 +809,240 @@ class ShannonPrimeWanBlockCache:
         return (patched,)
 
 
+class ShannonPrimeWanBlockSkip:
+    """
+    Phase 12 Block-Level Self-Attention Skip for Wan 2.x DiT.
+
+    Upgrades ShannonPrimeWanBlockCache from K-hook level to block-forward level.
+    Instead of just caching the K projection, this patches WanAttentionBlock.forward()
+    to skip the ENTIRE self-attention computation (Q/K/V projections + attention scores)
+    on cache-hit steps.
+
+    adaLN-correct cache hit path:
+      1. Recompute adaLN modulation from current timestep embedding (trivial cost)
+      2. Apply cached pre-gate attention output (y) with the CURRENT step's gate (e[2])
+         — this correctly tracks sigma-dependent brightness/contrast changes
+      3. Run cross-attention and FFN fresh every step (sigma-accurate)
+
+    This achieves ~50% compute skip for stable blocks (L00-L03) on cached steps:
+      - Skipped: norm1, Q projection, K projection, V projection, attention scores,
+                 output projection  (O(tokens² × dim) — dominant cost at 4K)
+      - Not skipped: adaLN modulation recompute (trivial), cross-attn, FFN
+
+    Per-block rolling cosine similarity oracle (Mertens Oracle):
+      Each block tracks rolling cos_sim between cached y and fresh y.
+      If rolling_sim drops below drift_threshold, window is halved automatically.
+      If it recovers above restore_threshold, full window is restored.
+
+    Block tier map (from sigma-sweep Phase 12 data):
+      L00-L03: window=10 steps (Permanent Granite, cos_sim>0.95)
+      L04-L08: window=3  steps (Stable Sand)
+      L09+:    window=0  steps (no cache — volatile)
+    """
+
+    CATEGORY     = "shannon-prime"
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION     = "patch"
+    DESCRIPTION  = (
+        "Block-level self-attention skip for Wan DiT. "
+        "Patches WanAttentionBlock.forward() to skip Q/K/V+attention "
+        "for stable early blocks. adaLN-correct: caches pre-gate y, "
+        "reapplies current gate on cache hit. ~50% compute saving for L00-L03."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {"model": ("MODEL",)},
+            "optional": {
+                "tier_0_window": ("INT",   {"default": 10, "min": 0, "max": 30,
+                    "tooltip": "Cache window for L00-L03 (Permanent Granite)"}),
+                "tier_1_window": ("INT",   {"default": 3,  "min": 0, "max": 15,
+                    "tooltip": "Cache window for L04-L08 (Stable Sand)"}),
+                "drift_threshold": ("FLOAT", {"default": 0.85, "min": 0.50, "max": 0.99,
+                    "step": 0.01,
+                    "tooltip": "Rolling cos_sim below this halves the cache window (Mertens Oracle)"}),
+                "verbose": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    @classmethod
+    def IS_CHANGED(cls, *a, **k):
+        return float("nan")
+
+    def patch(self, model, tier_0_window=10, tier_1_window=3,
+              drift_threshold=0.85, verbose=False):
+        import types
+        import comfy.model_management
+
+        try:
+            from comfy.ldm.wan.model import repeat_e
+        except ImportError:
+            # Fallback implementation of repeat_e if import fails
+            def repeat_e(e, x):
+                repeats = 1
+                if e.size(1) > 1:
+                    repeats = x.size(1) // e.size(1)
+                if repeats == 1:
+                    return e
+                return e.repeat_interleave(repeats, dim=1)
+
+        patched = model.clone()
+        blocks  = list(_iter_wan_blocks(patched))
+        if not blocks:
+            print("[SP BlockSkip] no Wan blocks found — passing through")
+            return (patched,)
+
+        n_blocks = len(blocks)
+
+        # Tier window map
+        def get_window(i):
+            if i < 4:
+                return tier_0_window
+            if i < 9:
+                return tier_1_window
+            return 0
+
+        # Shared state across all patched blocks
+        state = {
+            'global_step':    [0],      # step counter (incremented by block-0)
+            'attn_cache':     {},       # block_idx -> y tensor (CPU)
+            'step_cached':    {},       # block_idx -> step at which y was cached
+            'rolling_sim':    {},       # block_idx -> float (recent cos_sim)
+            'effective_win':  {},       # block_idx -> current effective window
+        }
+        for i, _ in blocks:
+            w = get_window(i)
+            state['effective_win'][i] = w
+            state['rolling_sim'][i]   = 1.0
+
+        def _cos_sim(a, b):
+            a_f = a.float().reshape(-1)
+            b_f = b.float().reshape(-1)
+            n   = (a_f.norm() * b_f.norm()).clamp(min=1e-10)
+            return float((a_f * b_f).sum() / n)
+
+        def make_patched_forward(orig_forward, block_idx, blk):
+            window = get_window(block_idx)
+
+            def patched_forward(x, e, freqs, context,
+                                context_img_len=257,
+                                transformer_options={}):
+                # ── Step counter ────────────────────────────────────────────
+                if block_idx == 0:
+                    state['global_step'][0] += 1
+                step = state['global_step'][0]
+
+                # ── Recompute adaLN modulation (always — cheap) ─────────────
+                cast = comfy.model_management.cast_to
+                if e.ndim < 4:
+                    e_mods = (cast(blk.modulation, dtype=x.dtype, device=x.device)
+                              + e).chunk(6, dim=1)
+                else:
+                    e_mods = (cast(blk.modulation, dtype=x.dtype, device=x.device)
+                              .unsqueeze(0) + e).unbind(2)
+
+                eff_win  = state['effective_win'].get(block_idx, 0)
+                cached_s = state['step_cached'].get(block_idx, -999)
+                age      = step - cached_s
+
+                if eff_win > 0 and age < eff_win and block_idx in state['attn_cache']:
+                    # ── CACHE HIT ─────────────────────────────────────────────
+                    y = state['attn_cache'][block_idx].to(device=x.device,
+                                                          dtype=x.dtype)
+                    x = torch.addcmul(x.contiguous(), y,
+                                      repeat_e(e_mods[2], x))
+                    if verbose:
+                        print(f"[SP BlockSkip] B{block_idx:02d} HIT  "
+                              f"step={step} age={age}/{eff_win} "
+                              f"sim={state['rolling_sim'].get(block_idx, 1):.3f}")
+                else:
+                    # ── CACHE MISS: run self-attention ─────────────────────────
+                    x = x.contiguous()
+                    y = blk.self_attn(
+                        torch.addcmul(repeat_e(e_mods[0], x),
+                                      blk.norm1(x),
+                                      1 + repeat_e(e_mods[1], x)),
+                        freqs, transformer_options=transformer_options
+                    )
+
+                    # ── Mertens Oracle: update rolling cos_sim ─────────────────
+                    if block_idx in state['attn_cache'] and eff_win > 0:
+                        y_prev = state['attn_cache'][block_idx].to(device=y.device,
+                                                                    dtype=y.dtype)
+                        sim = _cos_sim(y, y_prev)
+                        # Exponential moving average
+                        state['rolling_sim'][block_idx] = (
+                            0.7 * state['rolling_sim'].get(block_idx, 1.0)
+                            + 0.3 * sim
+                        )
+                        # Adaptive window: halve on drift, restore on stability
+                        nom_win = get_window(block_idx)
+                        if state['rolling_sim'][block_idx] < drift_threshold:
+                            state['effective_win'][block_idx] = max(1, nom_win // 2)
+                        elif state['rolling_sim'][block_idx] > 0.92:
+                            state['effective_win'][block_idx] = nom_win
+
+                        if verbose:
+                            print(f"[SP BlockSkip] B{block_idx:02d} MISS "
+                                  f"step={step} sim={sim:.3f} "
+                                  f"roll={state['rolling_sim'][block_idx]:.3f} "
+                                  f"win={state['effective_win'][block_idx]}")
+
+                    # Cache the pre-gate attention output on CPU
+                    state['attn_cache'][block_idx]   = y.detach().cpu()
+                    state['step_cached'][block_idx]  = step
+
+                    x = torch.addcmul(x, y, repeat_e(e_mods[2], x))
+                    del y
+
+                # ── Cross-attention + FFN (always fresh) ─────────────────────
+                x = x + blk.cross_attn(
+                    blk.norm3(x), context,
+                    context_img_len=context_img_len,
+                    transformer_options=transformer_options
+                )
+                patches = transformer_options.get("patches", {})
+                if "attn2_patch" in patches:
+                    for p in patches["attn2_patch"]:
+                        x = p({"x": x, "transformer_options": transformer_options})
+
+                y = blk.ffn(torch.addcmul(repeat_e(e_mods[3], x),
+                                          blk.norm2(x),
+                                          1 + repeat_e(e_mods[4], x)))
+                x = torch.addcmul(x, y, repeat_e(e_mods[5], x))
+                return x
+
+            return patched_forward
+
+        # Patch each block's forward method
+        n_patched = 0
+        for i, blk in blocks:
+            window = get_window(i)
+            if window > 0:
+                orig   = blk.forward
+                blk.forward = make_patched_forward(orig, i, blk)
+                n_patched += 1
+
+        tier0 = [i for i, _ in blocks if i < 4]
+        tier1 = [i for i, _ in blocks if 4 <= i < 9]
+        print(f"[SP BlockSkip] Patched {n_patched}/{n_blocks} WanAttentionBlock.forward()")
+        print(f"[SP BlockSkip] Tier-0 win={tier_0_window}: blocks {tier0}")
+        print(f"[SP BlockSkip] Tier-1 win={tier_1_window}: blocks {tier1}")
+        print(f"[SP BlockSkip] Mertens Oracle drift_threshold={drift_threshold:.2f}")
+        print(f"[SP BlockSkip] Savings: self-attn Q+K+V+scores skipped on cache hits "
+              f"(~50% compute for patched blocks)")
+
+        return (patched,)
+
+
 NODE_CLASS_MAPPINGS = {
     "ShannonPrimeWanCache":        ShannonPrimeWanCache,
     "ShannonPrimeWanCacheStats":   ShannonPrimeWanCacheStats,
     "ShannonPrimeWanCacheSqfree":  ShannonPrimeWanCacheSqfree,
     "ShannonPrimeWanSelfExtract":  ShannonPrimeWanSelfExtract,
     "ShannonPrimeWanBlockCache":   ShannonPrimeWanBlockCache,
+    "ShannonPrimeWanBlockSkip":    ShannonPrimeWanBlockSkip,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -823,4 +1051,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ShannonPrimeWanCacheSqfree": "Shannon-Prime: Wan Cross-Attn Cache (Sqfree)",
     "ShannonPrimeWanSelfExtract": "Shannon-Prime: Wan Self-Attn Extract (Phase 12)",
     "ShannonPrimeWanBlockCache":  "Shannon-Prime: Wan Block-Tier Self-Attn Cache",
+    "ShannonPrimeWanBlockSkip":   "Shannon-Prime: Wan Block-Level Self-Attn Skip",
 }

@@ -1065,25 +1065,13 @@ class ShannonPrimeWanBlockSkip:
                                   f"roll={state['rolling_sim'][block_idx]:.3f} "
                                   f"win={state['effective_win'][block_idx]}")
 
-                    # Cache the pre-gate attention output + block input reference.
-                    # Store on GPU if y fits in available VRAM (avoids PCIe roundtrip
-                    # on cache hit, which dominates at high token counts like 720p+).
-                    # Fall back to CPU if VRAM is tight.
-                    try:
-                        import comfy.model_management as mm
-                        free_vram = mm.get_free_memory(y.device)
-                        y_bytes   = y.element_size() * y.numel()
-                        x_bytes   = x.element_size() * x.numel()
-                        # Keep buffer of 2x (other activations need room)
-                        if free_vram > (y_bytes + x_bytes) * 2:
-                            state['attn_cache'][block_idx] = y.detach()       # GPU
-                            state['x_ref'][block_idx]      = x.detach()       # GPU
-                        else:
-                            state['attn_cache'][block_idx] = y.detach().cpu() # CPU fallback
-                            state['x_ref'][block_idx]      = x.detach().cpu()
-                    except Exception:
-                        state['attn_cache'][block_idx]   = y.detach().cpu()
-                        state['x_ref'][block_idx]        = x.detach().cpu()
+                    # Always store on CPU. ComfyUI uses async weight offloading streams
+                    # that consume GPU memory dynamically. GPU y-cache competes with
+                    # these streams → legacy ModelPatcher offloads model weights →
+                    # VRAM death spiral at 720p+ (3s→40s/it observed).
+                    # CPU PCIe cost (~4ms per hit at 720p) is far cheaper than offloading.
+                    state['attn_cache'][block_idx]   = y.detach().cpu()
+                    state['x_ref'][block_idx]        = x.detach().cpu()
                     state['step_cached'][block_idx]  = step
                     state['hit_streak'][block_idx]   = 0   # reset on miss
 

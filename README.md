@@ -1,91 +1,64 @@
-# Shannon-Prime VHT2 for ComfyUI
+# Shannon-Prime for ComfyUI
 
-Shannon-Prime is a custom node pack for ComfyUI that accelerates Wan 2.1 and 2.2 video generation via VHT2 spectral compression of attention caches. It exploits two structural invariants in the Wan DiT architecture — text cross-attention context is identical across all denoising timesteps, and early self-attention blocks are geometrically stable — to skip redundant computation without changing output quality.
+**Accelerate Wan 2.x video generation by caching what doesn't change.**
 
----
+Shannon-Prime is a set of custom ComfyUI nodes that exploit structural invariants in the Wan DiT architecture to skip redundant computation during video denoising. Cross-attention context (T5/UMT5 text embeddings) is constant across all denoising steps, and many self-attention blocks are geometrically stable for long stretches. Shannon-Prime caches both, re-applying only the cheap adaLN gating from the current timestep so sigma tracking stays accurate.
 
-## What It Does
-
-### ShannonPrimeWanCache (ship path)
-
-Patches every `WanAttentionBlock.cross_attn` in the loaded model. T5/UMT5 text embeddings are constant across all ~50 denoising timesteps — the K/V projections of those embeddings are therefore identical on every step. This node computes them once, compresses via the VHT2 spectral transform (4-band banded quantization + Möbius squarefree-first reorder), and returns reconstructed K/V on all subsequent steps.
-
-- **Compression**: 3.56x on the K/V tensors
-- **Output correlation**: 0.9984 (cosine similarity to uncompressed baseline)
-- **Speedup**: 1.20x end-to-end on Wan 2.2 TI2V-5B Q8, RTX 2060, 720p
-
-Cache invalidation uses a content fingerprint (three flat-index samples + shape + dtype) rather than pointer identity, so ComfyUI's per-timestep tensor reallocations do not break the cache.
-
-### ShannonPrimeWanBlockSkip (Phase 12, ship path)
-
-Patches `WanAttentionBlock.forward()` directly for early DiT blocks that show stable self-attention geometry across denoising steps. On cache-hit steps, the entire self-attention computation (norm1, Q/K/V projections, attention scores, output projection) is skipped. The adaLN gate from the current timestep embedding is still applied to the cached pre-gate output `y`, so brightness/contrast tracking remains sigma-accurate.
-
-**Block tiers** derived from sigma-sweep Phase 12 diagnostics:
-
-| Tier | Blocks | Default window | Stability |
-|------|--------|----------------|-----------|
-| 0 — Permanent Granite | L00-L03 | 10 steps | cos_sim > 0.95 across 10 steps |
-| 1 — Stable Sand | L04-L08 | 3 steps | moderate stability |
-| uncached | L09-L29 | 0 | volatile, always recompute |
-
-The **Mertens Oracle** adapts windows dynamically. Each block tracks a rolling cosine similarity (EMA α=0.7) between its cached `y` and the freshly computed `y` on miss steps. If rolling_sim drops below `drift_threshold`, the effective window is halved. If it recovers above 0.92, the nominal window is restored. Streak-miss forces a recompute after N consecutive hits (N adapts to rolling_sim: >0.95→10, >0.90→7, >0.85→5, else→3).
-
-**Results** (Wan 2.2 TI2V-5B Q8, RTX 2060, 1280×720, 9 frames, 20 steps):
-
-| Configuration | Denoising (s/it) | Total (s) |
-|---------------|-----------------|-----------|
-| Baseline (cross-attn cache only) | 3.32 | 77 |
-| + BlockSkip (no CacheFlush) | 3.19 | 111 |
-| + BlockSkip + CacheFlush | 3.19 | ~77 |
-
-At 720p the cache overhead equals the compute saved. The crossover into net speedup is at higher resolutions (4K) where the O(tokens²) attention dominates.
-
-No composition warping has been observed. The `patch()` call in BlockSkip clears all stale caches at the start of every ComfyUI prompt execution, unconditionally.
-
-### ShannonPrimeWanCacheFlush (Phase 12, essential)
-
-**Must be placed between KSampler and VAEDecode** when using BlockSkip. BlockSkip caches `y` tensors on CPU (per-block norm proxies instead of full tensors, ~43KB/block vs 66MB/block). Without the flush, those tensors remain allocated during VAE decode and impose a ~34s overhead on 720p runs. The flush node clears all BlockSkip state dicts and calls `torch.cuda.empty_cache()` to give the VAE maximum VRAM headroom.
-
-### ShannonPrimeWanSigmaSwitch (Phase 13, experimental)
-
-Attaches to block-0's forward and adjusts BlockSkip's effective windows at each step based on the current sigma. High sigma → wider windows (more caching). Low sigma → narrower windows (more recompute). **Currently bypassed**: `transformer_options['sigmas']` is not populated by standard KSampler or SamplerCustomAdvanced in current ComfyUI. The node detects this on first call and latches a bypass for the entire generation, preserving nominal BlockSkip windows. Awaiting a sigma source in `transformer_options`.
-
-### ShannonPrimeWanRicciSentinel (Phase 13 diagnostic)
-
-Per-step sigma regime and cache window timeline reporter. Attach after BlockSkip + SigmaSwitch. With `verbose=True`, prints every step's `e_mag`, HIGH/LOW regime label, and effective windows for blocks 0 and 4. At each generation boundary, prints a compact summary table showing the full trajectory and the step at which the HIGH→LOW switch occurred. Use this to verify oracle behavior and tune `sigma_split_frac`.
+The result: **7 s/step on hardware that does 32 s/step stock** (RTX 2060 12GB, Wan 2.2 TI2V-5B Q8, 720p, `--lowvram`). No quality loss on stable blocks; configurable aggressiveness for the rest.
 
 ---
 
-## Results
+## Key Features
 
-**Phase 12 validated run** (Wan 2.2 TI2V-5B Q8, RTX 2060, 1280×720, 9 frames, 20 steps):
+**Cross-Attention Caching** — text encoder K/V projections are identical every step. Compute once, serve from CPU cache forever. Zero overhead after step 1.
 
-- Cross-attention cache: **1.20x speedup**, **0.9984 output correlation** (cosine similarity)
-- BlockSkip: ~3.19 s/it denoising vs 3.32 s/it baseline
-- With CacheFlush: total time matches baseline; without it, VAE adds ~34s overhead
-- No warping confirmed across multiple seeds and prompts
-- CUDA kernel `shannon_prime_cuda_wan` compiled and confirmed `mode=cuda` on startup
+**Block-Level Self-Attention Skip** — for stable DiT blocks, cache the entire self-attention output. On hit steps, skip Q/K/V projections, attention scores, and output projection entirely. Only recompute the adaLN gate (trivial) and add the cached result.
+
+**Cross-Attention Output Caching** — the full cross-attention output (not just K/V) is cached alongside self-attention. Since the text side is frozen, cross-attention output is even more stable than self-attention.
+
+**TURBO Mode** — optionally cache the FFN pre-gate output too. On hit steps, an entire DiT block reduces to: adaLN modulation + three CPU→GPU tensor loads + three additions. Near-zero compute.
+
+**4-Tier Block System** — blocks are grouped by empirically measured stability. Each tier has independent cache windows, so you can be aggressive on granite-stable early blocks and conservative (or off) on volatile late blocks.
+
+**Mixed Precision Caching** — cache in fp16, fp8, or mixed (fp16 for precision-sensitive tiers, fp8 for aggressive tiers). fp8 halves CPU memory and PCIe transfer time. Mixed gives you both: precision where it matters, savings where the approximation is already aggressive.
+
+**SVI Compatible** — works with Step-Video Inference 6-step distilled Wan 2.2 workflows, including non-monotonic sigma schedules and dual hi/lo-noise GGUF loading.
+
+---
+
+## Performance
+
+Measured on RTX 2060 12GB + 32GB system RAM, Wan 2.2 TI2V-5B Q8, 720p 9 frames, `--lowvram`:
+
+| Configuration | Step Time | Notes |
+|---|---|---|
+| Stock (no Shannon-Prime) | ~32 s/step | Baseline |
+| Cross-attn cache only | ~28 s/step | Eliminates redundant text K/V |
+| + BlockSkip tier-0/1 | ~15 s/step | Skips self-attn on 9 stable blocks |
+| + Cross-attn output cache | ~8.4 s/step | Skips cross-attn compute on hit |
+| + TURBO (all 40 blocks, fp8) | ~7.0 s/step | Near-zero compute on cached steps |
+
+Output quality: visually identical at tier-0/1 defaults. Tier-2/3 with TURBO trades minor detail for significant speed. The tradeoff is configurable per-tier.
 
 ---
 
 ## Supported Models
 
-| Model | Type | Support level |
-|-------|------|---------------|
-| Wan 2.1 14B | Dense | Full — all nodes |
-| Wan 2.1 1.3B | Dense | Full — all nodes |
-| Wan 2.2 A14B T2V | MoE (2 experts, high/low) | Full — expert-aware caching |
-| Wan 2.2 A14B I2V | MoE (2 experts) | Full — boundary=0.900 |
-| Wan 2.2 TI2V-5B | Dense | Full — fully tested, ship path |
+| Model | Type | Status |
+|---|---|---|
+| Wan 2.2 TI2V-5B | Dense | Fully tested, primary target |
+| Wan 2.2 A14B T2V/I2V | MoE (2 experts) | Full — expert-aware caching |
+| Wan 2.1 14B | Dense | Full |
+| Wan 2.1 1.3B | Dense | Full |
 
-For MoE models, apply `ShannonPrimeWanCache` separately to each expert `MODEL` object. The two caches are naturally partitioned because the experts are separate Python objects in ComfyUI's graph.
+For MoE models with separate expert MODEL objects, apply `ShannonPrimeWanCache` to each expert independently.
 
 ---
 
 ## Installation
 
+**Option 1: Clone into custom_nodes (recommended)**
 ```bash
-# Clone with submodule (required — shannon-prime math core is a submodule)
 cd /path/to/ComfyUI/custom_nodes
 git clone --recursive https://github.com/nihilistau/shannon-prime-comfyui.git
 ```
@@ -96,302 +69,186 @@ cd shannon-prime-comfyui
 git submodule update --init --recursive
 ```
 
-**Symlink option** (Windows, from an elevated prompt):
+**Option 2: Symlink (Windows, elevated prompt)**
 ```batch
-mklink /J C:\ComfyUI\custom_nodes\shannon-prime-comfyui D:\F\shannon-prime-repos\shannon-prime-comfyui
+mklink /J C:\ComfyUI\custom_nodes\shannon-prime-comfyui D:\path\to\shannon-prime-comfyui
 ```
 
-**CUDA kernel** (optional, builds `shannon_prime_cuda_wan` for accelerated VHT2):
-```bash
-cd lib/shannon-prime
-python scripts/build_cuda.py
-# or
-scripts/build_test_cuda.bat
-```
-The nodes fall back to pure PyTorch if the CUDA extension is not built. A `mode=cuda` log line on startup confirms the extension is active.
+**Dependencies:** None beyond ComfyUI itself. All math lives in the `lib/shannon-prime` submodule (pure Python + optional C/CUDA). No pip packages required.
 
 ---
 
-## Quickstart: Phase 12 Ship Workflow
+## Quick Start
 
-The stable production path. Load `workflows/wan22_ti2v_5b_phase12_ship.json` in ComfyUI.
+### Minimal (cross-attention caching only)
 
-**Node chain:**
+Wire one node between your model loader and sampler:
+
+```
+UnetLoaderGGUF → ShannonPrimeWanCache → KSampler → VAEDecode
+```
+
+Leave all defaults. Eliminates redundant text K/V computation on every step after the first.
+
+### Recommended (cross-attn + block skip)
+
 ```
 UnetLoaderGGUF
-  └─► ShannonPrimeWanCache     (cross-attn K/V compression)
-        └─► ShannonPrimeWanBlockSkip  (self-attn skip for L00-L08)
-              └─► KSampler
-                    └─► ShannonPrimeWanCacheFlush  (clear before VAE)
-                          └─► VAEDecode
-                                └─► SaveAnimatedWEBP
+  → ShannonPrimeWanCache          (cross-attn K/V caching)
+    → ShannonPrimeWanBlockSkip    (self-attn + cross-attn + optional FFN skip)
+      → KSampler
+        → ShannonPrimeWanCacheFlush   (free memory before VAE)
+          → VAEDecode
+            → SaveAnimatedWEBP
 ```
 
-**Recommended ComfyUI launch flags for 720p+:**
-```bash
-python main.py --normalvram --disable-async-offload
-```
+**CacheFlush is essential** — without it, cached tensors stay allocated during VAE decode and can cause massive slowdowns or OOM.
 
-**Minimum settings to get started:**
-- `ShannonPrimeWanCache`: leave defaults (`k_bits=5,4,4,3`, `v_bits=5,4,4,3`, `use_mobius=True`)
-- `ShannonPrimeWanBlockSkip`: leave defaults (`tier_0_window=10`, `tier_1_window=3`, `drift_threshold=0.85`, `x_drift_t0=0.30`, `x_drift_t1=0.25`)
-- `ShannonPrimeWanCacheFlush`: no parameters — just wire it between KSampler and VAEDecode
+### FULL SEND (maximum speed)
+
+Set BlockSkip to:
+- `tier_0_window=10`, `tier_1_window=3`, `tier_2_window=5`, `tier_3_window=3`
+- `cache_ffn=True` (TURBO mode)
+- `cache_dtype=mixed` (fp16 for tier-0/1, fp8 for tier-2/3)
+
+This caches all 40 blocks across self-attn, cross-attn, and FFN. On cache-hit steps, entire blocks reduce to adaLN + three tensor additions. Achieves ~7 s/step on hardware that does 32 s/step stock.
+
+**Caveat:** TURBO at high resolutions (10K+ tokens) can exhaust CPU memory. If you see step times degrading across outputs, reduce tier-2/3 windows or disable `cache_ffn`.
 
 ---
 
-## Node Reference
+## Nodes
 
 ### ShannonPrimeWanCache
 
-| Input | Type | Default | Description |
-|-------|------|---------|-------------|
-| `model` | MODEL | — | Wan model from UnetLoader/UnetLoaderGGUF |
-| `k_bits` | STRING | `"5,4,4,3"` | K band bit allocation (4 bands). Cross-attn has no RoPE, so K and V use symmetric profiles. |
-| `v_bits` | STRING | `"5,4,4,3"` | V band bit allocation. |
-| `use_mobius` | BOOLEAN | `True` | Möbius squarefree-first reorder on both K and V. |
-
-**Output:** MODEL (patched)
-
-Prints: `[Shannon-Prime] patched N/N Wan blocks (head_dim=..., compression~3.56x)`
-
----
-
-### ShannonPrimeWanCacheStats
+**Cross-attention K/V caching.** Patches every `WanAttentionBlock.cross_attn` to cache text encoder K/V projections on CPU after the first step. Content-based fingerprinting ensures cache correctness across ComfyUI's per-step tensor reallocations.
 
 | Input | Type | Default | Description |
-|-------|------|---------|-------------|
-| `model` | MODEL | — | Model previously patched by WanCache |
-
-**Output:** MODEL (pass-through)
-
-Prints: `hits=N misses=N hit_rate=0.XXX compression=3.56x` at each queue execution. Wire between WanCache and BlockSkip, or between KSampler and VAEDecode.
-
----
-
-### ShannonPrimeWanCacheSqfree
-
-Aggressive variant. Targets Q8+ backbones with sqfree prime-Hartley basis + Möbius CSR predictor + optional SU(2) spinor sheet-bit correction.
-
-| Input | Type | Default | Description |
-|-------|------|---------|-------------|
-| `model` | MODEL | — | Wan model |
-| `band_bits` | STRING | `"3,3,3,3,3"` | 5-band torus-aligned allocation |
-| `residual_bits` | INT | `3` | N-bit residual quantization (1–4). 3 is the Pareto point. |
-| `use_spinor` | BOOLEAN | `True` | SU(2) sheet-bit correction at causal-mask boundary |
-
-**Output:** MODEL (patched)
-
----
-
-### ShannonPrimeWanSelfExtract
-
-Phase 12 diagnostic. Hooks `blk.self_attn.k` on every WanAttentionBlock and captures K projection output at a target denoising step. Saves a `.npz` file for analysis with `sp_diagnostics.py`.
-
-| Input | Type | Default | Description |
-|-------|------|---------|-------------|
-| `model` | MODEL | — | Wan model |
-| `capture_step` | INT | `25` | Denoising step to capture (0=first/noisiest) |
-| `max_tokens` | INT | `256` | Max token positions stored per block |
-| `output_dir` | STRING | `""` | Output directory (defaults to `ComfyUI/output/shannon_prime/`) |
-
-**Output:** MODEL (hooks attached, observer only — does not change inference)
-
-Post-run: `python sp_diagnostics.py --input wan_self_attn_stepN.npz --sqfree --layer-period 4`
-
----
-
-### ShannonPrimeWanBlockCache
-
-Older Phase 12 node. Hooks `blk.self_attn.k` and caches K projections using VHT2 skeleton coefficients. Superseded by `ShannonPrimeWanBlockSkip` for production use (BlockSkip operates at block-forward level, skipping more compute). Retained for comparison and diagnostic use.
-
-| Input | Type | Default | Description |
-|-------|------|---------|-------------|
-| `model` | MODEL | — | Wan model |
-| `skeleton_frac` | FLOAT | `0.30` | VHT2 skeleton fraction (30% = 30% of coefficients stored) |
-| `tier_0_window` | INT | `10` | Cache window for L00-L03 |
-| `tier_1_window` | INT | `3` | Cache window for L04-L08 |
-| `verbose` | BOOLEAN | `False` | Log HIT/STORE per block per step |
-
-**Output:** MODEL (patched)
-
----
+|---|---|---|---|
+| `model` | MODEL | — | Wan model from any loader |
+| `k_bits` | STRING | `"5,4,4,3"` | K band bit allocation (4 VHT2 frequency bands, low→high) |
+| `v_bits` | STRING | `"5,4,4,3"` | V band bit allocation |
+| `use_mobius` | BOOLEAN | `True` | Möbius squarefree-first reorder |
 
 ### ShannonPrimeWanBlockSkip
 
+**Block-level computation skip.** The primary performance node. Caches self-attention output, cross-attention output, and optionally FFN output per block. On cache-hit steps, skips all heavy computation and applies only the cheap adaLN gating.
+
 | Input | Type | Default | Description |
-|-------|------|---------|-------------|
-| `model` | MODEL | — | Wan model (apply after WanCache) |
-| `tier_0_window` | INT | `10` | Nominal cache window for L00-L03 (Permanent Granite) |
-| `tier_1_window` | INT | `3` | Nominal cache window for L04-L08 (Stable Sand) |
-| `drift_threshold` | FLOAT | `0.85` | Rolling cos_sim below this halves the window (Mertens Oracle) |
-| `x_drift_t0` | FLOAT | `0.30` | x-drift threshold for Tier-0. 0.0 = disabled. |
-| `x_drift_t1` | FLOAT | `0.25` | x-drift threshold for Tier-1. Linear tightening L04→t1, L08→t1×0.80. |
-| `verbose` | BOOLEAN | `False` | Log HIT/MISS/STREAK-MISS/x-DRIFT per block per step |
+|---|---|---|---|
+| `model` | MODEL | — | Apply after WanCache |
+| `tier_0_window` | INT | `10` | Cache window for L00–L03 (Permanent Granite). Most stable blocks. |
+| `tier_1_window` | INT | `3` | Cache window for L04–L08 (Stable Sand). |
+| `tier_2_window` | INT | `0` | Cache window for L09–L15 (Volatile). 0=disabled. Try 2–5 for speed. |
+| `tier_3_window` | INT | `0` | Cache window for L16–L39 (Deep/late). 0=disabled. YOLO: try 2–3. |
+| `cache_ffn` | BOOLEAN | `False` | TURBO: cache FFN pre-gate output. Hit steps become near-zero compute. |
+| `cache_dtype` | `fp16`/`fp8`/`mixed` | `fp16` | Cache precision. mixed = fp16 for tier-0/1, fp8 for tier-2/3. |
+| `verbose` | BOOLEAN | `False` | Per-block HIT/MISS console logging. |
 
-**Output:** MODEL (patched)
+**Tier map:**
 
----
+| Tier | Blocks | Stability | Default Window | Streak |
+|---|---|---|---|---|
+| 0 — Permanent Granite | L00–L03 | cos_sim > 0.95 for 10+ steps | 10 | 10 |
+| 1 — Stable Sand | L04–L08 | Moderate stability | 3 | 5 |
+| 2 — Volatile | L09–L15 | Lower stability | 0 (off) | 3 |
+| 3 — Deep/Late | L16–L39 | Texture detail | 0 (off) | 3 |
 
 ### ShannonPrimeWanCacheFlush
 
+**Memory cleanup.** Place between KSampler output and VAEDecode. Clears all BlockSkip caches (self-attn, cross-attn, FFN) and cross-attn `_SPCachingLinear` wrappers, then calls `torch.cuda.empty_cache()`. Without this, cached tensors compete with VAE for VRAM.
+
+| Input | Type | Description |
+|---|---|---|
+| `model` | MODEL | The patched model |
+| `samples` | LATENT | Latent from KSampler (passed through unchanged) |
+
+### ShannonPrimeWanCacheStats
+
+**Observer.** Reports cache hit/miss statistics. Wire anywhere in the model chain to see hit rates and compression ratios. Pass-through — does not modify the model.
+
+### ShannonPrimeWanCacheSqfree
+
+**Aggressive compression variant.** Uses sqfree prime-Hartley basis + Möbius CSR predictor + optional SU(2) spinor sheet-bit correction. Higher compression for Q8+ backbones at the cost of more computation.
+
 | Input | Type | Default | Description |
-|-------|------|---------|-------------|
-| `model` | MODEL | — | The BlockSkip-patched model (from KSampler output or stored reference) |
-| `samples` | LATENT | — | Latent samples from KSampler (passed through unchanged) |
-
-**Output:** LATENT (pass-through)
-
-Clears all BlockSkip `attn_cache`, `step_cached`, `x_norm`, `rolling_sim`, and `hit_streak` dicts, then calls `torch.cuda.empty_cache()`. Safe to use even if BlockSkip is not present in the workflow.
-
----
+|---|---|---|---|
+| `model` | MODEL | — | Wan model |
+| `band_bits` | STRING | `"3,3,3,3,3"` | 5-band torus-aligned allocation |
+| `residual_bits` | INT | `3` | N-bit residual quantization (1–4) |
+| `use_spinor` | BOOLEAN | `True` | SU(2) sheet-bit correction at causal boundary |
 
 ### ShannonPrimeWanSigmaSwitch
 
-Phase 13, currently bypassed. Place after BlockSkip, before KSampler.
-
-| Input | Type | Default | Description |
-|-------|------|---------|-------------|
-| `model` | MODEL | — | BlockSkip-patched model |
-| `high_sigma_mult` | FLOAT | `1.5` | Window multiplier at high sigma (early steps) |
-| `low_sigma_mult` | FLOAT | `0.5` | Window multiplier at low sigma (late steps) |
-| `sigma_split_frac` | FLOAT | `0.5` | Fraction of e_mag range at which to switch regimes |
-| `verbose` | BOOLEAN | `False` | Log sigma value and window decisions per step |
-
-**Output:** MODEL (patched)
-
-**Note:** Bypasses automatically if `transformer_options['sigmas']` is unavailable (standard ComfyUI samplers do not populate it). Nominal BlockSkip windows are preserved when bypassed.
-
----
+**Sigma-adaptive cache windows (experimental).** Adjusts BlockSkip windows based on current denoising sigma. High sigma (noisy, early steps) → wider windows. Low sigma (refined, late steps) → narrower windows. Hooks into the model's sigma schedule via `model_function_wrapper`.
 
 ### ShannonPrimeWanRicciSentinel
 
-Phase 13 diagnostic. Place after SigmaSwitch (or after BlockSkip if SigmaSwitch is not in the graph), before KSampler.
+**Diagnostic.** Per-step sigma regime and cache window timeline reporter. Prints `e_mag`, HIGH/LOW regime label, and effective windows at each step. Prints a compact summary table at generation boundaries.
 
-| Input | Type | Default | Description |
-|-------|------|---------|-------------|
-| `model` | MODEL | — | Model after BlockSkip/SigmaSwitch |
-| `sigma_split_frac` | FLOAT | `0.5` | Match SigmaSwitch's split for consistent HIGH/LOW labels |
-| `verbose` | BOOLEAN | `True` | Print every step's e_mag, regime, and window values |
+### ShannonPrimeWanSelfExtract
 
-**Output:** MODEL (patched, observer only)
+**Phase 12 diagnostic.** Hooks self-attention K projections and saves `.npz` files for offline analysis with `sp_diagnostics.py`. Used to derive the tier map and measure per-block stability.
 
 ---
 
-## Settings Guide
+## Tuning Guide
 
-### k_bits / v_bits (WanCache)
+**Start conservative, then open up.** The defaults (tier-0=10, tier-1=3, everything else off) are safe for any Wan model and prompt. From there:
 
-The 4-band bit allocation maps to VHT2 frequency bands ordered low→high. The first band captures the most energy; allocating more bits there preserves fidelity. The defaults `5,4,4,3` are calibrated for cross-attention (no RoPE on the K tensor). Do not use the self-attention default (`5,5,4,3`) here — that first-K-band boost is RoPE-specific and will over-allocate bits on cross-attn K.
+1. **Enable tier-2** (`tier_2_window=3`): adds 7 more blocks to caching. Watch for quality changes in fine detail.
+2. **Enable tier-3** (`tier_3_window=2`): caches all 40 blocks. Texture detail may soften slightly.
+3. **Enable TURBO** (`cache_ffn=True`): skips FFN on hit steps. Maximum speed. Quality impact depends on schedule length — fine for 6-step SVI, monitor for 20+ steps.
+4. **Switch to mixed dtype** (`cache_dtype=mixed`): saves ~40% CPU memory on tier-2/3 caches with negligible quality impact (those tiers are already approximate).
+5. **Full fp8** (`cache_dtype=fp8`): maximum memory savings. Precision-sensitive content (text rendering, faces) may show minor artifacts.
 
-Reduce bits (e.g., `4,4,3,3`) to trade correlation for more VRAM savings. Increase (e.g., `6,5,4,3`) to raise fidelity. 3-bit minimum per band is the Shannon saturation floor for this transform.
-
-### tier_0_window / tier_1_window (BlockSkip)
-
-Higher window = more steps skipped per recompute. Tier-0 blocks (L00-L03) have been measured at cos_sim > 0.95 for 10 steps — the default of 10 is aggressive but validated. Tier-1 (L04-L08) is more volatile; the default of 3 steps is conservative. Do not set Tier-0 higher than 15 or Tier-1 higher than 7 without running your own correlation measurements.
-
-### drift_threshold (Mertens Oracle)
-
-The oracle halves `effective_win` when `rolling_sim` falls below this value. 0.85 is the default; lower values (0.75–0.80) allow more drift before triggering. At CFG=1, blocks L04-L08 show `sim=0.000` (completely unstable at those blocks) — the oracle correctly forces `window=1` in that regime regardless of `drift_threshold`.
-
-### x_drift_t0 / x_drift_t1
-
-x-drift checks the per-token norm change of the input latent `x` between the current step and the cached step. If the mean fractional change exceeds the threshold, a forced miss is issued and the window is halved.
-
-- `x_drift_t0=0.30`: For Tier-0. Catches "floor drop" events (sudden latent jumps) without over-triggering on normal per-step variation (which runs 0.10–0.25).
-- `x_drift_t1=0.25`: For Tier-1. Linear tightening within the tier: L04 uses `t1`, L08 uses `t1 × 0.80`.
-- Set to `0.0` to disable x-drift entirely (faster, but risks composition warping on some prompts).
+**Memory budget:** each cached block stores up to 3 tensors (self-attn y, cross-attn output, FFN output). At 720p in fp16, that's roughly 100MB per tensor. TURBO with all 40 blocks at fp16 would be ~12GB CPU. At fp8 or mixed, roughly 7–8GB. If you see step time degradation across sequential outputs, CPU memory is full and model weights are being offloaded — reduce tier windows or enable fp8.
 
 ---
 
 ## Workflow Integration
 
-### Minimal addition (cross-attn cache only)
+All nodes output standard ComfyUI `MODEL` or `LATENT` types. Compatible with `KSampler`, `SamplerCustomAdvanced`, and any node that accepts MODEL or LATENT.
 
-```
-[existing UnetLoader] → ShannonPrimeWanCache → [existing KSampler]
-```
+**Cancel/interrupt cleanup:** on cancel, the `/sp/cleanup` endpoint (auto-registered on startup) unloads models and clears CUDA cache. Alternatively, `patch()` on BlockSkip clears stale caches at the start of every queue execution automatically.
 
-No other changes needed. All downstream nodes see a normal MODEL.
-
-### Full ship path (Phase 12)
-
-```
-UnetLoader/UnetLoaderGGUF
-  └─► ShannonPrimeWanCache
-        └─► ShannonPrimeWanBlockSkip
-              └─► KSampler
-                    └─► ShannonPrimeWanCacheFlush
-                          └─► VAEDecode
-```
-
-### Full Phase 13 path (experimental)
-
-```
-UnetLoader/UnetLoaderGGUF
-  └─► ShannonPrimeWanCache
-        └─► ShannonPrimeWanBlockSkip
-              └─► ShannonPrimeWanSigmaSwitch
-                    └─► ShannonPrimeWanRicciSentinel
-                          └─► KSampler
-                                └─► ShannonPrimeWanCacheFlush
-                                      └─► VAEDecode
-```
-
-### SamplerCustomAdvanced compatibility
-
-All nodes output MODEL or LATENT and do not depend on sampler internals. They are compatible with both `KSampler` and `SamplerCustomAdvanced`. `ShannonPrimeWanCacheFlush` takes MODEL + LATENT and outputs LATENT — wire it after whatever sampler node you use.
-
-### Cancel/Interrupt cleanup
-
-On ComfyUI cancel or workflow interrupt, BlockSkip caches may remain allocated. To free them:
-
-```
-GET /sp/cleanup
-```
-
-This endpoint walks all WanAttentionBlock forwards on all loaded models and clears BlockSkip state dicts, then calls `torch.cuda.empty_cache()`. Equivalent to running `ShannonPrimeWanCacheFlush` manually.
-
-If the endpoint is not registered in your ComfyUI version, simply re-run any workflow — `patch()` on `ShannonPrimeWanBlockSkip` clears stale caches unconditionally at the start of each queue execution.
-
----
-
-## CUDA Kernel
-
-The optional CUDA extension accelerates the VHT2 butterfly transform and Möbius reorder. Without it, the nodes run in pure PyTorch and are still correct and functional.
-
-**Build:**
+**ComfyUI launch flags for lowVRAM setups:**
 ```bash
-cd lib/shannon-prime
-python scripts/build_cuda.py
+python main.py --lowvram --port 8189
 ```
-
-**Windows batch:**
-```batch
-lib\shannon-prime\scripts\build_test_cuda.bat
-```
-
-**Verify:** On ComfyUI startup, look for:
-```
-[Shannon-Prime] shannon_prime_cuda_wan mode=cuda
-```
-
-If you see `mode=torch` instead, the extension was not found or failed to compile. The nodes continue to work in PyTorch mode.
 
 ---
 
-## Phase 13 Status
+## How It Works
 
-| Feature | Status |
-|---------|--------|
-| Cross-attn K/V cache (WanCache) | Shipped — stable |
-| Block-skip self-attn (BlockSkip) | Shipped — stable |
-| Cache flush (CacheFlush) | Shipped — essential for 720p+ |
-| Mertens Oracle adaptive windows | Shipped — active in BlockSkip |
-| Sqfree+spinor variant (CacheSqfree) | Available — Q8+ opt-in |
-| SigmaSwitch | Experimental — bypassed (no sigma source in transformer_options) |
-| RicciSentinel | Experimental — diagnostic use |
-| Block-tier K-hook cache (BlockCache) | Superseded by BlockSkip — retained for comparison |
-| SelfExtract | Diagnostic — Phase 12 analysis tool |
+Shannon-Prime exploits the mathematical structure of the Wan DiT denoising process. The core insight is that the Vilenkin-Hartley Transform (VHT2) decomposes attention tensors into spectral bands whose energy decays predictably — enabling principled compression with known error bounds.
+
+The cross-attention cache works because T5 text embeddings are constant: the same context vector enters every denoising step, producing identical K/V projections. Caching these after step 1 eliminates all redundant text encoder→attention computation.
+
+The block skip works because DiT blocks in the early layers (L00–L08) produce self-attention outputs that change slowly across consecutive denoising steps. The cosine similarity between step N and step N+k remains above 0.95 for k=10 on the most stable blocks. By caching the pre-gate output and re-applying only the cheap adaLN gate from the current timestep, we maintain sigma-accurate brightness/contrast tracking while skipping all the expensive attention computation.
+
+The TURBO mode extends this to FFN, which is also stable across cached windows. On a hit step, an entire DiT block becomes: read 6 floats from the timestep embedding → load 3 cached tensors from CPU → multiply-add → done.
+
+For the mathematical foundations, see the papers in `lib/shannon-prime/docs/`: *Position Is Arithmetic*, *KV Cache Is A View*, and *Multiplicative Lattice Combined*.
+
+---
+
+## Project Structure
+
+```
+shannon-prime-comfyui/
+├── __init__.py              # ComfyUI entry point, /sp/cleanup endpoint
+├── pyproject.toml           # ComfyUI Manager metadata
+├── nodes/
+│   ├── __init__.py          # Re-exports NODE_CLASS_MAPPINGS
+│   └── shannon_prime_nodes.py   # All node definitions
+├── lib/
+│   └── shannon-prime/       # Core math submodule (VHT2, Möbius, backends)
+├── docs/                    # Technical documentation
+├── workflows/               # Example ComfyUI workflows
+├── web/                     # JS extension for cleanup on cancel
+└── LICENSE                  # AGPLv3 + Commercial dual license
+```
 
 ---
 
@@ -399,6 +256,6 @@ If you see `mode=torch` instead, the extension was not found or failed to compil
 
 **AGPLv3** for open-source, academic, and non-proprietary use. Derivative works must share alike.
 
-**Dual License** — a commercial license is available for proprietary integration.
+**Commercial license** available for proprietary integration. Contact: Ray Daniels (raydaniels@gmail.com).
 
 Copyright (C) 2026 Ray Daniels. See [LICENSE](LICENSE).

@@ -1004,17 +1004,22 @@ class ShannonPrimeWanBlockSkip:
 
                     is_new_gen = False
                     gap_reason = ""
-                    # Primary: wall-clock gap (catches ALL generation boundaries).
-                    # 60s gives safe margin even at 50s/it. The inter-step gap is
-                    # always << 60s; the inter-generation gap (VAE + idle) is >> 60s.
+                    # PRIMARY: e-magnitude monotonicity.
+                    # Within any single Wan generation the timestep embedding
+                    # magnitude (e_mag) is strictly decreasing with sigma. Any
+                    # increase — even 1-2% — means sigma has reset → new generation.
+                    # This fires reliably regardless of step timing or how quickly
+                    # the user queues the next run, making it the principal detector.
+                    if last_em is not None and last_em > 1e-6 and e_mag > last_em * 1.02:
+                        is_new_gen = True
+                        gap_reason = f"e-increase({last_em:.3f}->{e_mag:.3f})"
+                    # SECONDARY: wall-clock gap — catches the very first run after
+                    # a long idle (where last_em is None or stale) and edge cases
+                    # where the scheduler holds sigma steady for multiple steps.
                     if state['last_block0_t'][0] > 0 and t_gap > 60.0:
                         is_new_gen = True
-                        gap_reason = f"t_gap={t_gap:.1f}s"
-                    # Secondary: e-magnitude spike upward (sigma reset to max)
-                    if last_em is not None and last_em > 1e-6 and e_mag > last_em * 2.0:
-                        is_new_gen = True
-                        gap_reason += f" e-jump({last_em:.2f}->{e_mag:.2f})"
-                    # Tertiary: step-counter anomalies
+                        gap_reason += f" t_gap={t_gap:.1f}s"
+                    # TERTIARY: step-counter anomalies
                     if stale > 0 or (step <= 2 and last > 5):
                         is_new_gen = True
                         gap_reason += f" stale={stale}"

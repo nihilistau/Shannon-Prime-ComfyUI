@@ -982,7 +982,7 @@ class ShannonPrimeWanBlockSkip:
                         if verbose:
                             print(f"[SP BlockSkip] B{block_idx:02d} x-DRIFT "
                                   f"step={step} drift={x_dr:.3f}>{state['x_drift_thr']:.2f}"
-                                  f" → forced miss, win halved to "
+                                  f" -> forced miss, win halved to "
                                   f"{state['effective_win'][block_idx]}")
 
                 if (not x_drift_forced_miss

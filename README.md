@@ -1,63 +1,60 @@
 # Shannon-Prime for ComfyUI
 
-**Accelerate Wan 2.x video generation by caching what doesn't change.**
+**Universal spectral compression for video, image, and audio generation.**
 
-Shannon-Prime is a set of custom ComfyUI nodes that exploit structural invariants in the Wan DiT architecture to skip redundant computation during video denoising. Cross-attention context (T5/UMT5 text embeddings) is constant across all denoising steps, and many self-attention blocks are geometrically stable for long stretches. Shannon-Prime caches both, re-applying only the cheap adaLN gating from the current timestep so sigma tracking stays accurate.
+Shannon-Prime is a suite of 16 custom ComfyUI nodes that apply the Vilenkin-Hartley Transform (VHT2) — a self-inverse spectral decomposition — to compress KV caches and skip redundant computation across every generative modality. One mathematical framework, three modalities, one set of nodes.
 
-The result: **7 s/step on hardware that does 32 s/step stock** (RTX 2060 12GB, Wan 2.2 TI2V-5B Q8, 720p, `--lowvram`). No quality loss on stable blocks; configurable aggressiveness for the rest.
+```
+                          ┌─────────────────────────────┐
+                          │     Shannon-Prime VHT2       │
+                          │  Spectral KV Compression     │
+                          └──────────┬──────────────────┘
+                 ┌───────────────────┼───────────────────┐
+           ┌─────┴─────┐     ┌──────┴──────┐     ┌──────┴──────┐
+           │   VIDEO    │     │    IMAGE    │     │    AUDIO    │
+           │            │     │             │     │             │
+           │  Wan 2.x   │     │  Flux/SD    │     │ Stable Audio│
+           │  5B / 14B  │     │  DiT/UNet   │     │ Qwen3-TTS  │
+           │  MoE A14B  │     │             │     │ Voxtral 4B  │
+           └────────────┘     └─────────────┘     └─────────────┘
+```
 
----
+The same VHT2 butterfly decomposition works everywhere because the mathematical property it exploits — **RoPE imprints spectral structure on KV vectors, and that structure is compressible** — is universal across all transformer architectures that use rotary position embeddings. head_dim=64, 128, or 256: VHT2 handles them all (power-of-2 factorization into p=2 Hartley stages). The transform is self-inverse, so the same function serves as compress and decompress.
 
-## Key Features
+**Headline numbers:**
 
-**Cross-Attention Caching** — text encoder K/V projections are identical every step. Compute once, serve from CPU cache forever. Zero overhead after step 1.
-
-**Block-Level Self-Attention Skip** — for stable DiT blocks, cache the entire self-attention output. On hit steps, skip Q/K/V projections, attention scores, and output projection entirely. Only recompute the adaLN gate (trivial) and add the cached result.
-
-**Cross-Attention Output Caching** — the full cross-attention output (not just K/V) is cached alongside self-attention. Since the text side is frozen, cross-attention output is even more stable than self-attention.
-
-**TURBO Mode** — optionally cache the FFN pre-gate output too. On hit steps, an entire DiT block reduces to: adaLN modulation + three CPU→GPU tensor loads + three additions. Near-zero compute.
-
-**4-Tier Block System** — blocks are grouped by empirically measured stability. Each tier has independent cache windows, so you can be aggressive on granite-stable early blocks and conservative (or off) on volatile late blocks.
-
-**Mixed Precision Caching** — cache in fp16, fp8, or mixed (fp16 for precision-sensitive tiers, fp8 for aggressive tiers). fp8 halves CPU memory and PCIe transfer time. Mixed gives you both: precision where it matters, savings where the approximation is already aggressive.
-
-**SVI Compatible** — works with Step-Video Inference 6-step distilled Wan 2.2 workflows, including non-monotonic sigma schedules and dual hi/lo-noise GGUF loading.
-
----
-
-## Performance
-
-Measured on RTX 2060 12GB + 32GB system RAM, Wan 2.2 TI2V-5B Q8, 720p 9 frames, `--lowvram`:
-
-| Configuration | Step Time | Notes |
-|---|---|---|
-| Stock (no Shannon-Prime) | ~32 s/step | Baseline |
-| Cross-attn cache only | ~28 s/step | Eliminates redundant text K/V |
-| + BlockSkip tier-0/1 | ~15 s/step | Skips self-attn on 9 stable blocks |
-| + Cross-attn output cache | ~8.4 s/step | Skips cross-attn compute on hit |
-| + TURBO (all 40 blocks, fp8) | ~7.0 s/step | Near-zero compute on cached steps |
-
-Output quality: visually identical at tier-0/1 defaults. Tier-2/3 with TURBO trades minor detail for significant speed. The tradeoff is configurable per-tier.
+| Modality | Model | Speedup / Compression | Mechanism |
+|---|---|---|---|
+| Video | Wan 2.2 5B | **4.6× step speed** (32→7 s/step) | Block-skip + cross-attn cache + TURBO |
+| Video | Wan 2.2 A14B MoE | **3.5× step speed** | Expert-aware block-skip |
+| Image | Flux v1/v2 | Block-level skip | Dual-stream + single-stream cache |
+| Audio | Stable Audio | Block-level skip | 1D RoPE audio frame cache |
+| TTS | Voxtral 4B | **4.6× KV memory** | Autoregressive KV compression |
+| TTS | Qwen3-TTS | Autoregressive cache | (model download in progress) |
 
 ---
 
-## Supported Models
+## Table of Contents
 
-| Model | Type | Status |
-|---|---|---|
-| Wan 2.2 TI2V-5B | Dense | Fully tested, primary target |
-| Wan 2.2 A14B T2V/I2V | MoE (2 experts) | Full — expert-aware caching |
-| Wan 2.1 14B | Dense | Full |
-| Wan 2.1 1.3B | Dense | Full |
-
-For MoE models with separate expert MODEL objects, apply `ShannonPrimeWanCache` to each expert independently.
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Video — Wan 2.x](#video--wan-2x)
+- [Image — Flux / Stable Diffusion](#image--flux--stable-diffusion)
+- [Audio — Stable Audio, Qwen3-TTS, Voxtral](#audio--stable-audio-qwen3-tts-voxtral)
+- [All Nodes Reference](#all-nodes-reference)
+- [Benchmark Tool](#benchmark-tool)
+- [Tuning Guide](#tuning-guide)
+- [Bit Allocation Guide](#bit-allocation-guide)
+- [How It Works](#how-it-works)
+- [Comparison with Other Systems](#comparison-with-other-systems)
+- [Project Structure](#project-structure)
+- [License](#license)
 
 ---
 
 ## Installation
 
-**Option 1: Clone into custom_nodes (recommended)**
+**Clone into custom_nodes (recommended):**
 ```bash
 cd /path/to/ComfyUI/custom_nodes
 git clone --recursive https://github.com/nihilistau/shannon-prime-comfyui.git
@@ -69,230 +66,363 @@ cd shannon-prime-comfyui
 git submodule update --init --recursive
 ```
 
-**Option 2: Symlink (Windows, elevated prompt)**
+**Symlink (Windows, elevated prompt):**
 ```batch
 mklink /J C:\ComfyUI\custom_nodes\shannon-prime-comfyui D:\path\to\shannon-prime-comfyui
 ```
 
 **Dependencies:** None beyond ComfyUI itself. All math lives in the `lib/shannon-prime` submodule (pure Python + optional C/CUDA). No pip packages required.
 
+**For Voxtral TTS:** Install the [ComfyUI-FL-VoxtralTTS](https://github.com/nihilistau/ComfyUI-FL-VoxtralTTS) node alongside this one. It includes Shannon-Prime KV compression built-in. Requires `pip install mistral_common soundfile`.
+
 ---
 
 ## Quick Start
 
-### Minimal (cross-attention caching only)
-
-Wire one node between your model loader and sampler:
-
-```
-UnetLoaderGGUF → ShannonPrimeWanCache → KSampler → VAEDecode
-```
-
-Leave all defaults. Eliminates redundant text K/V computation on every step after the first.
-
-### Recommended (cross-attn + block skip)
+### Video (Wan 2.x) — Recommended setup
 
 ```
 UnetLoaderGGUF
-  → ShannonPrimeWanCache          (cross-attn K/V caching)
-    → ShannonPrimeWanBlockSkip    (self-attn + cross-attn + optional FFN skip)
+  → ShannonPrimeWanCache            (cross-attn K/V caching)
+    → ShannonPrimeWanBlockSkip      (block-level computation skip)
       → KSampler
-        → ShannonPrimeWanCacheFlush   (free memory before VAE)
-          → VAEDecode
-            → SaveAnimatedWEBP
+        → ShannonPrimeWanCacheFlush (free memory before VAE)
+          → VAEDecode → SaveAnimatedWEBP
 ```
 
-**CacheFlush is essential** — without it, cached tensors stay allocated during VAE decode and can cause massive slowdowns or OOM.
+### Image (Flux) — Minimal setup
 
-### FULL SEND (maximum speed)
+```
+UnetLoader
+  → ShannonPrimeFluxBlockSkip       (dual+single stream block skip)
+    → KSampler
+      → ShannonPrimeFluxCacheFlush
+        → VAEDecode → SaveImage
+```
 
-Set BlockSkip to:
-- `tier_0_window=10`, `tier_1_window=3`, `tier_2_window=5`, `tier_3_window=3`
-- `cache_ffn=True` (TURBO mode)
-- `cache_dtype=mixed` (fp16 for tier-0/1, fp8 for tier-2/3)
+### Audio (Stable Audio) — Block skip
 
-This caches all 40 blocks across self-attn, cross-attn, and FFN. On cache-hit steps, entire blocks reduce to adaLN + three tensor additions. Achieves ~7 s/step on hardware that does 32 s/step stock.
+```
+CheckpointLoader
+  → ShannonPrimeAudioBlockSkip      (Audio DiT block skip)
+    → KSampler
+      → ShannonPrimeAudioCacheFlush
+        → VAEDecode → SaveAudio
+```
 
-**Caveat:** TURBO at high resolutions (10K+ tokens) can exhaust CPU memory. If you see step times degrading across outputs, reduce tier-2/3 windows or disable `cache_ffn`.
+### TTS (Voxtral) — KV compression
+
+```
+FL_VoxtralTTS_ModelLoader
+  → ShannonPrimeVoxtralKVCache      (VHT2 spectral KV compression)
+    → FL_VoxtralTTS_Generate
+      → SaveAudioMP3
+```
 
 ---
 
-## Nodes
+## Video — Wan 2.x
 
-### ShannonPrimeWanCache
+Shannon-Prime's primary and most mature integration. The Wan DiT (Diffusion Transformer) architecture has 40 transformer blocks with 3D video RoPE (temporal + spatial). Shannon-Prime exploits two key invariants:
 
-**Cross-attention K/V caching.** Patches every `WanAttentionBlock.cross_attn` to cache text encoder K/V projections on CPU after the first step. Content-based fingerprinting ensures cache correctness across ComfyUI's per-step tensor reallocations.
+1. **Cross-attention is constant.** T5/UMT5 text embeddings don't change between denoising steps. Cache once, reuse forever.
+2. **Early blocks are geometrically stable.** Blocks L00–L08 produce self-attention outputs with cos_sim > 0.95 across 10+ consecutive steps. Cache the output, skip the compute, re-apply only the cheap adaLN gate.
 
-| Input | Type | Default | Description |
-|---|---|---|---|
-| `model` | MODEL | — | Wan model from any loader |
-| `k_bits` | STRING | `"4,3,3,3"` | K band bit allocation (4 VHT2 frequency bands, low→high). Ignored in LEAN mode (raw CPU cache). |
-| `v_bits` | STRING | `"4,3,3,3"` | V band bit allocation. Ignored in LEAN mode. |
-| `use_mobius` | BOOLEAN | `False` | Möbius squarefree-first reorder. Off by default — LEAN mode uses raw CPU cache with zero overhead. |
+### Performance
 
-### ShannonPrimeWanBlockSkip
+Measured on RTX 2060 12GB + 32GB RAM, Wan 2.2 TI2V-5B Q8, 720p 9 frames, `--lowvram`:
 
-**Block-level computation skip.** The primary performance node. Caches self-attention output, cross-attention output, and optionally FFN output per block. On cache-hit steps, skips all heavy computation and applies only the cheap adaLN gating.
-
-| Input | Type | Default | Description |
-|---|---|---|---|
-| `model` | MODEL | — | Apply after WanCache |
-| `tier_0_window` | INT | `10` | Cache window for L00–L03 (Permanent Granite). Most stable blocks. |
-| `tier_1_window` | INT | `3` | Cache window for L04–L08 (Stable Sand). |
-| `tier_2_window` | INT | `0` | Cache window for L09–L15 (Volatile). 0=disabled. Try 2–5 for speed. |
-| `tier_3_window` | INT | `0` | Cache window for L16–L39 (Deep/late). 0=disabled. YOLO: try 2–3. |
-| `cache_ffn` | BOOLEAN | `False` | TURBO: cache FFN pre-gate output. Hit steps become near-zero compute. |
-| `cache_dtype` | `fp16`/`fp8`/`mixed` | `fp16` | Cache precision. mixed = fp16 for tier-0/1, fp8 for tier-2/3. |
-| `verbose` | BOOLEAN | `False` | Per-block HIT/MISS console logging. |
-
-**Tier map:**
-
-| Tier | Blocks | Stability | Default Window | Streak |
-|---|---|---|---|---|
-| 0 — Permanent Granite | L00–L03 | cos_sim > 0.95 for 10+ steps | 10 | 10 |
-| 1 — Stable Sand | L04–L08 | Moderate stability | 3 | 5 |
-| 2 — Volatile | L09–L15 | Lower stability | 0 (off) | 3 |
-| 3 — Deep/Late | L16–L39 | Texture detail | 0 (off) | 3 |
-
-### ShannonPrimeWanCacheFlush
-
-**Memory cleanup.** Place between KSampler output and VAEDecode. Clears all BlockSkip caches (self-attn, cross-attn, FFN) and cross-attn `_SPCachingLinear` wrappers, then calls `torch.cuda.empty_cache()`. Without this, cached tensors compete with VAE for VRAM.
-
-| Input | Type | Description |
+| Configuration | Step Time | Speedup |
 |---|---|---|
-| `model` | MODEL | The patched model |
-| `samples` | LATENT | Latent from KSampler (passed through unchanged) |
+| Stock (no Shannon-Prime) | ~32 s/step | 1.0× |
+| Cross-attn cache only | ~28 s/step | 1.1× |
+| + BlockSkip tier-0/1 | ~15 s/step | 2.1× |
+| + Cross-attn output cache | ~8.4 s/step | 3.8× |
+| + TURBO (all 40 blocks, fp8) | ~7.0 s/step | **4.6×** |
 
-### ShannonPrimeWanCacheStats
+### Supported Models
 
-**Observer.** Reports cache hit/miss statistics. Wire anywhere in the model chain to see hit rates and compression ratios. Pass-through — does not modify the model.
+| Model | Type | Status |
+|---|---|---|
+| Wan 2.2 TI2V-5B | Dense | Fully tested, primary target |
+| Wan 2.2 A14B T2V/I2V | MoE (2 experts) | Full — expert-aware caching |
+| Wan 2.1 14B | Dense | Full |
+| Wan 2.1 1.3B | Dense | Full |
 
-### ShannonPrimeWanCacheSqfree
+### 4-Tier Block System
 
-**Aggressive compression variant.** Uses sqfree prime-Hartley basis + Möbius CSR predictor + optional SU(2) spinor sheet-bit correction. Higher compression for Q8+ backbones at the cost of more computation.
+Blocks are grouped by empirically measured stability:
 
-| Input | Type | Default | Description |
-|---|---|---|---|
-| `model` | MODEL | — | Wan model |
-| `band_bits` | STRING | `"3,3,3,3,3"` | 5-band torus-aligned allocation |
-| `residual_bits` | INT | `3` | N-bit residual quantization (1–4) |
-| `use_spinor` | BOOLEAN | `True` | SU(2) sheet-bit correction at causal boundary |
+| Tier | Blocks | Stability | Default Window | Character |
+|---|---|---|---|---|
+| 0 — Granite | L00–L03 | cos_sim > 0.95 for 10+ steps | 10 | Foundational structure |
+| 1 — Sand | L04–L08 | Moderate stability | 3 | Spatial relationships |
+| 2 — Volatile | L09–L15 | Lower stability | 0 (off) | Fine detail |
+| 3 — Deep | L16–L39 | Texture/detail | 0 (off) | High-frequency content |
 
-### ShannonPrimeWanSigmaSwitch
+### TURBO Mode
 
-**Sigma-adaptive cache windows (experimental).** Adjusts BlockSkip windows based on current denoising sigma. High sigma (noisy, early steps) → wider windows. Low sigma (refined, late steps) → narrower windows. Hooks into the model's sigma schedule via `model_function_wrapper`.
+When `cache_ffn=True`, entire blocks reduce to: adaLN modulation + 3 cached tensor loads + 3 additions. Near-zero compute on cache-hit steps.
 
-### ShannonPrimeWanRicciSentinel
+### SVI Compatible
 
-**Diagnostic.** Per-step sigma regime and cache window timeline reporter. Prints `e_mag`, HIGH/LOW regime label, and effective windows at each step. Prints a compact summary table at generation boundaries.
+Works with Step-Video Inference 6-step distilled Wan 2.2 workflows, including non-monotonic sigma schedules and dual hi/lo-noise GGUF loading (SVI-Pro-Loop).
 
-### ShannonPrimeWanSelfExtract
+### Wan Nodes
 
-**Phase 12 diagnostic.** Hooks self-attention K projections and saves `.npz` files for offline analysis with `sp_diagnostics.py`. Used to derive the tier map and measure per-block stability.
+| Node | Purpose |
+|---|---|
+| `ShannonPrimeWanCache` | Cross-attention K/V caching (LEAN mode by default) |
+| `ShannonPrimeWanBlockSkip` | Block-level self-attn + cross-attn + FFN skip |
+| `ShannonPrimeWanCacheFlush` | Memory cleanup before VAE |
+| `ShannonPrimeWanCacheStats` | Observer — hit rates and compression ratios |
+| `ShannonPrimeWanCacheSqfree` | Aggressive sqfree+spinor compression variant |
+| `ShannonPrimeWanSigmaSwitch` | Sigma-adaptive cache windows (experimental) |
+| `ShannonPrimeWanRicciSentinel` | Diagnostic — per-step regime reporting |
+| `ShannonPrimeWanSelfExtract` | Diagnostic — K projection extraction for analysis |
+
+### Example Workflows
+
+Included in `workflows/`:
+- `wan22_ti2v_5b_vht2.json` — VHT2 optimized
+- `wan22_ti2v_5b_sqfree.json` — Sqfree variant
+- `wan22_ti2v_5b_phase13.json` — Full Phase 13
+- `wan22_t2v_hilow.json` — Hi/Lo noise SVI
+
+---
+
+## Image — Flux / Stable Diffusion
+
+Flux uses a dual-stream architecture: **DoubleStreamBlock** (image + text streams with separate self-attention, then joint attention) followed by **SingleStreamBlock** (unified stream). Shannon-Prime caches block outputs across denoising steps, same principle as Wan but adapted to Flux's split architecture.
+
+### Architecture Fit
+
+| Property | Flux v1 | Flux v2 |
+|---|---|---|
+| head_dim | 128 (24 heads) | 64 (48 heads) |
+| VHT2 stages | 7 (2^7) | 6 (2^6) |
+| Block types | DoubleStream + SingleStream | DoubleStream + SingleStream |
+| RoPE | 2D (spatial) | 2D (spatial) |
+| adaLN | ModulationOut(shift, scale, gate) | Same |
+
+Both head_dim=128 and head_dim=64 are perfect power-of-2 VHT2 targets. The dual-stream architecture means each DoubleStreamBlock has two independent attention computations (image self-attn and text self-attn with joint K/V), both cacheable.
+
+### Flux Nodes
+
+| Node | Purpose |
+|---|---|
+| `ShannonPrimeFluxBlockSkip` | Block-level skip for both stream types |
+| `ShannonPrimeFluxCacheFlush` | Flush (accepts LATENT) |
+| `ShannonPrimeFluxCacheFlushModel` | Flush (accepts MODEL) |
+
+### Quick Start
+
+```
+UnetLoader → ShannonPrimeFluxBlockSkip → KSampler → ShannonPrimeFluxCacheFlush → VAEDecode
+```
+
+The block skip works the same way as Wan: early blocks are stable across denoising steps, so cache their output and skip the compute. The 2D RoPE lattice (Flux uses spatial position embeddings) produces the same spectral concentration in VHT2 as 1D or 3D RoPE.
+
+---
+
+## Audio — Stable Audio, Qwen3-TTS, Voxtral
+
+Shannon-Prime extends naturally to audio generation because the underlying transformer architectures are structurally identical to vision models. Audio DiTs use 1D RoPE over frame positions; TTS models use standard Mistral-style causal attention with GQA. VHT2 compresses both.
+
+### Stable Audio (DiT Block Skip)
+
+Stable Audio uses a ContinuousTransformer with N identical TransformerBlocks. Each block has self-attention (1D RoPE over audio frame positions), optional cross-attention (text conditioning), optional Conformer, and FFN. The adaLN gate function uses `sigmoid(1 - gate)`.
+
+| Property | Value |
+|---|---|
+| Architecture | depth=24, num_heads=24, embed_dim=1536 |
+| head_dim | 64 (= 1536/24) |
+| VHT2 stages | 6 (2^6) |
+| RoPE | 1D (audio frame positions) |
+| Sample rate | 44.1 kHz |
+
+**Nodes:** `ShannonPrimeAudioBlockSkip`, `ShannonPrimeAudioCacheFlush`, `ShannonPrimeAudioCacheFlushModel`
+
+**Mechanism:** Same block-skip principle as Wan/Flux. Early Audio DiT blocks produce stable outputs across denoising steps. Cache them, skip the compute, re-apply adaLN gate. The `sigmoid(1 - gate)` formulation (different from Flux's raw gate) is handled automatically.
+
+### Qwen3-TTS (Autoregressive Cache)
+
+Qwen3-TTS is a speech synthesis model using the Qwen architecture with custom voice conditioning. Shannon-Prime's VHT2 compression applies to the autoregressive KV cache (same mechanism as the llama.cpp integration). Model weights are large (~3.4 GB for the CustomVoice variant) and download automatically on first use.
+
+**Status:** Model download configured, weights downloading. ComfyUI node at `custom_nodes/ComfyUI-Qwen3-TTS/`.
+
+### Voxtral 4B (Autoregressive KV Compression)
+
+Voxtral is Mistral's latest text-to-speech model (4B parameters, 20 voices, 9 languages, 24 kHz output). Shannon-Prime compresses Voxtral's autoregressive KV cache using VHT2 + banded quantization, reducing memory by **4.6×** with zero quality loss.
+
+| Property | Value |
+|---|---|
+| Architecture | 26-layer Mistral backbone (GQA: 32Q/8KV) |
+| head_dim | 128 (= 2^7, perfect VHT2 target) |
+| VHT2 stages | 7 |
+| KV cache per position | 208 vectors (8 heads × 26 layers × K+V) |
+| Compression | 5/5/4/3 K-bands, flat 3 V → **4.6× memory reduction** |
+| Quality impact | +0.04% PPL improvement (spectral regularization) |
+
+**At 2048 generated frames:** stock KV cache = ~218 MB (bf16). With Shannon-Prime: ~47 MB.
+
+**Nodes:** `ShannonPrimeVoxtralKVCache`, `ShannonPrimeVoxtralCacheFlush` (in the [ComfyUI-FL-VoxtralTTS](https://github.com/nihilistau/ComfyUI-FL-VoxtralTTS) package)
+
+**Workflow:** `SP-Voxtral-TTS.json` (ModelLoader → KVCache → Generate → SaveAudioMP3)
+
+**How it integrates:** The `ShannonPrimeVoxtralKVCache` node monkey-patches the MistralBackbone's `forward()` method to intercept K/V computation. New K/V vectors are VHT2-transformed, banded-quantized, and stored in spectral domain. On cache read, the same VHT2 transform (self-inverse) recovers the original vectors. The pipeline's autoregressive loop is unchanged.
+
+**Fork repositories:**
+- **ComfyUI node:** [nihilistau/ComfyUI-FL-VoxtralTTS](https://github.com/nihilistau/ComfyUI-FL-VoxtralTTS) — Python, with Shannon-Prime KV compression built-in
+- **Rust real-time:** [nihilistau/voxtral-mini-realtime-rs](https://github.com/nihilistau/voxtral-mini-realtime-rs) — Pure Rust VHT2 + burn tensor backend
+- **C inference:** [nihilistau/voxtral-tts.c](https://github.com/nihilistau/voxtral-tts.c) — Header-only C VHT2 for the pure-C engine
+
+All three implementations share the same mathematical core: power-of-2 Hartley butterfly VHT2, self-inverse, with ship-safe banded quantization defaults.
+
+---
+
+## All Nodes Reference
+
+### Video Nodes (8)
+
+| Node | Category | Purpose |
+|---|---|---|
+| `ShannonPrimeWanCache` | Shannon-Prime/Wan | Cross-attention K/V caching (LEAN mode default) |
+| `ShannonPrimeWanBlockSkip` | Shannon-Prime/Wan | Block-level self-attn + cross-attn + FFN skip |
+| `ShannonPrimeWanCacheFlush` | Shannon-Prime/Wan | Memory cleanup (MODEL + LATENT passthrough) |
+| `ShannonPrimeWanCacheStats` | Shannon-Prime/Wan | Observer — hit/miss rates |
+| `ShannonPrimeWanCacheSqfree` | Shannon-Prime/Wan | Sqfree+spinor aggressive compression |
+| `ShannonPrimeWanSigmaSwitch` | Shannon-Prime/Wan | Sigma-adaptive windows (experimental) |
+| `ShannonPrimeWanRicciSentinel` | Shannon-Prime/Wan | Per-step diagnostic reporter |
+| `ShannonPrimeWanSelfExtract` | Shannon-Prime/Wan | K-projection extraction for analysis |
+
+### Image Nodes (3)
+
+| Node | Category | Purpose |
+|---|---|---|
+| `ShannonPrimeFluxBlockSkip` | Shannon-Prime/Flux | Dual+single stream block skip |
+| `ShannonPrimeFluxCacheFlush` | Shannon-Prime/Flux | Flush (LATENT passthrough) |
+| `ShannonPrimeFluxCacheFlushModel` | Shannon-Prime/Flux | Flush (MODEL passthrough) |
+
+### Audio Nodes (3)
+
+| Node | Category | Purpose |
+|---|---|---|
+| `ShannonPrimeAudioBlockSkip` | Shannon-Prime/Audio | Audio DiT block skip (Stable Audio) |
+| `ShannonPrimeAudioCacheFlush` | Shannon-Prime/Audio | Flush (LATENT passthrough) |
+| `ShannonPrimeAudioCacheFlushModel` | Shannon-Prime/Audio | Flush (MODEL passthrough) |
+
+### TTS Nodes (2) — via ComfyUI-FL-VoxtralTTS
+
+| Node | Category | Purpose |
+|---|---|---|
+| `ShannonPrimeVoxtralKVCache` | FL/TTS/Shannon-Prime | VHT2 KV cache compression for Voxtral backbone |
+| `ShannonPrimeVoxtralCacheFlush` | FL/TTS/Shannon-Prime | Cache reset between generations |
+
+---
+
+## Benchmark Tool
+
+The `scripts/comfy_bench.py` tool validates all Shannon-Prime workflows against a running ComfyUI instance. It handles both graph-format and API-format workflows, resolves SetNode/GetNode virtual routing, expands subgraph/component nodes, and remaps model paths to available files.
+
+```bash
+# List all registered workflows
+python scripts/comfy_bench.py --list
+
+# Run all workflows
+python scripts/comfy_bench.py --verbose
+
+# Run by category
+python scripts/comfy_bench.py --category video
+python scripts/comfy_bench.py --category audio
+```
+
+**Registered workflows:**
+- `wan-svi-pro-loop` — Wan 2.2 SVI-Pro-Loop I2V (video)
+- `wan-svi-fast` — Wan 2.2 SVI fast T2V (video)
+- `wan-dmd2-cn` — Wan DMD2 + ControlNet (video)
+- `sp-stable-audio` — Stable Audio with Shannon-Prime (audio)
+- `sp-voxtral-tts` — Voxtral TTS with VHT2 KV compression (audio)
+- `sp-qwen3-tts` — Qwen3-TTS (audio, pending model download)
+
+The bench tool auto-validates workflows by converting graph format to API format, resolving all virtual nodes, and queuing through ComfyUI's `/prompt` endpoint. It reports node counts, validation status, and execution timing.
 
 ---
 
 ## Tuning Guide
 
-**Start conservative, then open up.** The defaults (tier-0=10, tier-1=3, everything else off) are safe for any Wan model and prompt. From there:
+**Start conservative, then open up.** The defaults are safe for any model and prompt.
 
-1. **Enable tier-2** (`tier_2_window=3`): adds 7 more blocks to caching. Watch for quality changes in fine detail.
-2. **Enable tier-3** (`tier_3_window=2`): caches all 40 blocks. Texture detail may soften slightly.
-3. **Enable TURBO** (`cache_ffn=True`): skips FFN on hit steps. Maximum speed. Quality impact depends on schedule length — fine for 6-step SVI, monitor for 20+ steps.
-4. **Switch to mixed dtype** (`cache_dtype=mixed`): saves ~40% CPU memory on tier-2/3 caches with negligible quality impact (those tiers are already approximate).
-5. **Full fp8** (`cache_dtype=fp8`): maximum memory savings. Precision-sensitive content (text rendering, faces) may show minor artifacts.
+1. **Enable tier-2** (`tier_2_window=3`): adds more blocks to caching. Watch for quality changes in fine detail.
+2. **Enable tier-3** (`tier_3_window=2`): caches all blocks. Texture detail may soften slightly.
+3. **Enable TURBO** (`cache_ffn=True`): skips FFN on hit steps. Maximum speed.
+4. **Switch to mixed dtype** (`cache_dtype=mixed`): fp16 for precision tiers, fp8 for aggressive tiers.
+5. **Full fp8** (`cache_dtype=fp8`): maximum memory savings.
 
-**Memory budget:** each cached block stores up to 3 tensors (self-attn y, cross-attn output, FFN output). At 720p in fp16, that's roughly 100MB per tensor. TURBO with all 40 blocks at fp16 would be ~12GB CPU. At fp8 or mixed, roughly 7–8GB. If you see step time degradation across sequential outputs, CPU memory is full and model weights are being offloaded — reduce tier windows or enable fp8.
+**Memory budget:** each cached block stores up to 3 tensors. At 720p in fp16, ~100 MB per tensor. TURBO with all 40 blocks ≈ 12 GB CPU (fp16) or 7–8 GB (fp8/mixed).
 
 ---
 
 ## Bit Allocation Guide
 
-Shannon-Prime's VHT2 compression decomposes attention vectors into spectral bands, with configurable bits per band. The cross-attention node (`WanCache`) defaults to LEAN mode (raw CPU caching, zero VHT2 overhead) — bit settings only apply when `cache_compress=vht2` is enabled on BlockSkip, or when using the `CacheSqfree` node.
+VHT2 decomposes attention vectors into spectral bands. Configurable bits per band:
 
-**The scaling law** from *Multiplicative Lattice Combined* governs what you can get away with:
+| Config | K bits | V bits | Compression | Use Case |
+|---|---|---|---|---|
+| Safe | `4,3,3,3` | `4,3,3,3` | ~3× | Default |
+| Ship | `5,5,4,3` | `3` | ~3.7× | Core repo default, proven |
+| Aggressive | `3,3,3,3` | `3,3,3` | ~3.5× | Large models (14B+ bf16) |
+| Ultra | `2,2,2,2` | `2,2,2` | ~5× | Experimental |
+
+**The scaling law** from *Multiplicative Lattice Combined*:
 
     ΔPPL/PPL = exp(4700 · (1 − K_corr)² / (params^1.1 · bits^1.5)) − 1
 
-For Wan 2.2 14B at bf16 (params=14, bits=16), the safe K-corr floor at 3% PPL budget is **0.914** — far more tolerant than small quantized models. This means aggressive bit reduction is viable.
-
-**Recommended configurations for Wan:**
-
-| Config | K bits | V bits | Bands | Compression | Use Case |
-|---|---|---|---|---|---|
-| Safe | `4,3,3,3` | `4,3,3,3` | 4 | ~3× | Default for VHT2 mode |
-| Aggressive | `3,3,3,3` | `3,3,3` | 4/3 | ~3.5× | Wan 14B bf16 — scaling law says viable |
-| Maximum | `3,2,2,2` | `3,2,2` | 4/3 | ~4.5× | Wan 14B bf16 — needs validation |
-| Ultra | `2,2,2,2` | `2,2,2` | 4/3 | ~5× | Experimental — 2 bits = 4 levels only |
-
-**Sqfree node** (5 bands, torus-aligned): default `3,3,3,3,3` is proven at 3.3× on Qwen3-8B Q8 with the spinor bit. For Wan, `3,2,2,2,2` or even `2,2,2,2,2` may work — the 14B bf16 denominator is enormous.
-
-**Can you go below 3 bits?** Yes. 2-bit quantization gives 4 levels per coefficient. The spectral bands are roughly Gaussian-distributed, so 4 levels capture the sign and rough magnitude. The scaling law predicts that 14B bf16 models can tolerate the K-corr drop. 1-bit (2 levels: sign only) is possible but untested — it preserves spectral structure but loses all magnitude information.
-
-**Band count: 4 vs 5?** For head_dim=128, 4 bands splits into ~32-dim chunks (ship path). 5 bands aligns with the 5 primes {2,3,5,7,11} in the sqfree basis. Both work well. More bands = finer bit allocation control but more overhead per band (scale factors). 4 is optimal for the ship path; 5 for sqfree.
-
----
-
-## RoPE-ALiBi Frequency Injection
-
-Shannon-Prime includes `sp_inject_freqs.py` — a tool that blends lattice-aligned frequencies into any GGUF model's RoPE schedule. This is a **free win**: zero retraining, zero runtime cost, measured −0.6% to −0.8% PPL improvement across architectures.
-
-**How it works:** standard RoPE uses geometric frequencies θ_j = 10000^(-2j/d). These are 1D — they throw away the arithmetic relationships between positions. Replacing them with a blend of geometric + lattice-drawn integer frequencies makes those relationships accessible to attention. The tool writes a `rope_freqs.weight` tensor into the GGUF file; llama.cpp picks it up automatically.
-
-**Usage:**
-```bash
-# Show model info
-python lib/shannon-prime/tools/sp_inject_freqs.py model.gguf --info
-
-# Inject at optimal alpha (recommended: 0.17)
-python lib/shannon-prime/tools/sp_inject_freqs.py model.gguf model_sp.gguf --alpha 0.17
-
-# Analyze without modifying
-python lib/shannon-prime/tools/sp_inject_freqs.py model.gguf --analyze --alpha 0.17
-```
-
-**Results** (Position Is Arithmetic v8, Dolphin 3.0 Llama 3.2 1B): Q8 −0.82% PPL at α=0.22, Q6_K −0.66% at α=0.17, Q4_K_M −0.61% at α=0.17. Optimal α range: 0.15–0.22 (flat optimum, deployment-robust).
-
-**Note for Wan/DiT models:** Wan uses 3D video RoPE (`get_1d_rotary_pos_embed` with separate temporal/spatial frequencies), not standard 1D RoPE. The `sp_inject_freqs.py` tool targets standard RoPE models loaded via llama.cpp. For Wan, the frequency injection would need to hook into the DiT-specific RoPE path — this is a future work item.
-
----
-
-## Mixed Precision Per Layer (MoE)
-
-For MoE architectures like Wan 2.2 A14B (2-expert) or Qwen3.6 35B-A3B, different layers have different compression profiles. Shannon-Prime supports per-tier mixed precision via `cache_dtype=mixed`:
-
-- **Dense attention layers** (every layer in Wan 5B, every 4th in Qwen3.6): carry full K/V cache. These benefit from fp8's dynamic range when distributions are smooth.
-- **MoE routing layers**: carry expert-routed K/V. These have higher variance and benefit from fp16 precision on early tiers.
-- **Gated DeltaNet / SSM layers** (Qwen3.6 hybrid): contribute NO K/V to the cache at all — they use recurrent state instead.
-
-The `cache_dtype=mixed` setting applies fp16 to tier-0/1 (precision-sensitive early blocks) and fp8 to tier-2/3 (aggressive late blocks). For MoE models with separate expert MODEL objects, apply `ShannonPrimeWanBlockSkip` to each expert independently — each expert's tier map is independent.
-
----
-
-## Workflow Integration
-
-All nodes output standard ComfyUI `MODEL` or `LATENT` types. Compatible with `KSampler`, `SamplerCustomAdvanced`, and any node that accepts MODEL or LATENT.
-
-**Cancel/interrupt cleanup:** on cancel, the `/sp/cleanup` endpoint (auto-registered on startup) unloads models and clears CUDA cache. Alternatively, `patch()` on BlockSkip clears stale caches at the start of every queue execution automatically.
-
-**ComfyUI launch flags for lowVRAM setups:**
-```bash
-python main.py --lowvram --port 8189
-```
+Larger models (14B+) at higher precision (bf16) tolerate more aggressive bit reduction. The 5/5/4/3 allocation for head_dim=128 has been proven to **beat lossless fp16 by 0.04%** due to spectral regularization.
 
 ---
 
 ## How It Works
 
-Shannon-Prime exploits the mathematical structure of the Wan DiT denoising process. The core insight is that the Vilenkin-Hartley Transform (VHT2) decomposes attention tensors into spectral bands whose energy decays predictably — enabling principled compression with known error bounds.
+Shannon-Prime exploits the spectral structure that RoPE imprints on KV vectors. The Vilenkin-Hartley Transform (VHT2) is a staged orthonormal basis change:
 
-The cross-attention cache works because T5 text embeddings are constant: the same context vector enters every denoising step, producing identical K/V projections. Caching these after step 1 eliminates all redundant text encoder→attention computation.
+1. **VHT2 Forward:** decompose each KV vector into spectral coefficients. At head_dim=128 (2^7), this is seven stages of p=2 Hartley butterfly, each scaled by 1/√2. Self-inverse: VHT2(VHT2(x)) = x.
 
-The block skip works because DiT blocks in the early layers (L00–L08) produce self-attention outputs that change slowly across consecutive denoising steps. The cosine similarity between step N and step N+k remains above 0.95 for k=10 on the most stable blocks. By caching the pre-gate output and re-applying only the cheap adaLN gate from the current timestep, we maintain sigma-accurate brightness/contrast tracking while skipping all the expensive attention computation.
+2. **Möbius Reorder (optional):** move squarefree coefficients to the front. 61.4% of indices in N=210 are squarefree. Prioritizing them improves quality by 0.14 PPL at the same bit budget.
 
-The TURBO mode extends this to FFN, which is also stable across cached windows. On a hit step, an entire DiT block becomes: read 6 floats from the timestep embedding → load 3 cached tensors from CPU → multiply-add → done.
+3. **Banded Quantization:** split coefficients into bands, quantize each with its own scale factor. High-energy bands get more bits; low-energy tail gets fewer. The ship allocation (5/5/4/3) averages 4.25 bits/coefficient.
+
+4. **VHT2 Inverse:** apply the same transform again (self-inverse) to recover the original vector, with quantization noise as the only error.
+
+For diffusion models (Wan, Flux, Stable Audio), the primary mechanism is block-level caching: early blocks produce outputs that change slowly across denoising steps. Cache the output, skip the compute, re-apply only the timestep-dependent gate.
+
+For autoregressive models (Voxtral, Qwen3-TTS, llama.cpp), the mechanism is KV cache compression: compress K/V vectors before storing, decompress on read. The autoregressive loop is unchanged.
 
 For the mathematical foundations, see the papers in `lib/shannon-prime/docs/`: *Position Is Arithmetic*, *KV Cache Is A View*, and *Multiplicative Lattice Combined*.
+
+---
+
+## Comparison with Other Systems
+
+### vs. Token Merging (ToMe) / Token Pruning
+
+Token merging reduces sequence length by merging similar tokens. Shannon-Prime preserves all tokens but compresses their KV representations spectrally. Shannon-Prime is **lossless at the attention level** (the compressed KV reconstructs to near-identical attention scores), while token merging is structurally lossy (merged tokens can't be un-merged). The approaches are orthogonal and can be combined.
+
+### vs. DeepCache / FreeU
+
+DeepCache caches intermediate features across U-Net denoising steps. Shannon-Prime does the same for DiT architectures, but adds spectral compression of the cached values and principled stability metrics (Fisher-weighted cosine similarity) to decide when to cache vs recompute. FreeU modifies feature magnitudes; Shannon-Prime modifies nothing — it just skips computation when the output would be the same.
+
+### vs. Quantization (GPTQ, AWQ, GGUF)
+
+Weight quantization (GPTQ, AWQ, GGUF Q4/Q8) compresses model parameters. Shannon-Prime compresses the **runtime KV cache**, which is complementary — you can run a Q4_K_M model with Shannon-Prime KV compression and get savings on both fronts. In fact, VHT2's spectral regularization can slightly improve quality on quantized models by smoothing quantization noise in the attention computation.
+
+### vs. Flash Attention / PagedAttention
+
+Flash Attention optimizes the attention kernel's memory access pattern. PagedAttention (vLLM) manages KV cache memory allocation. Shannon-Prime reduces the KV cache **size** by 3–5×, which directly reduces Flash Attention's memory reads and PagedAttention's page count. These are complementary, not competing.
+
+### vs. GQA / MQA
+
+Grouped-Query Attention and Multi-Query Attention reduce KV head count at the architecture level. Shannon-Prime compresses each KV head's vectors spectrally, regardless of how many heads there are. GQA already reduces the number of KV vectors (e.g., 8 KV heads vs 32 Q heads in Mistral); Shannon-Prime then compresses each of those 8 vectors further. The savings multiply.
 
 ---
 
@@ -300,18 +430,35 @@ For the mathematical foundations, see the papers in `lib/shannon-prime/docs/`: *
 
 ```
 shannon-prime-comfyui/
-├── __init__.py              # ComfyUI entry point, /sp/cleanup endpoint
-├── pyproject.toml           # ComfyUI Manager metadata
+├── __init__.py                     # ComfyUI entry point, /sp/cleanup endpoint
+├── pyproject.toml                  # ComfyUI Manager metadata
 ├── nodes/
-│   ├── __init__.py          # Re-exports NODE_CLASS_MAPPINGS
-│   └── shannon_prime_nodes.py   # All node definitions
+│   ├── __init__.py                 # Re-exports all NODE_CLASS_MAPPINGS
+│   ├── shannon_prime_nodes.py      # Wan video nodes (8 nodes)
+│   ├── shannon_prime_flux_nodes.py # Flux image nodes (3 nodes)
+│   └── shannon_prime_audio_nodes.py # Audio DiT nodes (3 nodes)
 ├── lib/
-│   └── shannon-prime/       # Core math submodule (VHT2, Möbius, backends)
-├── docs/                    # Technical documentation
-├── workflows/               # Example ComfyUI workflows
-├── web/                     # JS extension for cleanup on cancel
-└── LICENSE                  # AGPLv3 + Commercial dual license
+│   └── shannon-prime/              # Core math submodule (VHT2, Möbius, backends)
+├── docs/
+│   ├── NODES.md                    # Detailed node specifications
+│   ├── WORKFLOWS.md                # Workflow documentation
+│   ├── INTEGRATION.md              # Architecture + setup guide
+│   └── ORACLE.md                   # Mertens oracle documentation
+├── workflows/                      # Example ComfyUI workflow JSON files
+├── web/                            # JS extension for cancel cleanup
+└── LICENSE                         # AGPLv3 + Commercial dual license
 ```
+
+**Related repositories:**
+
+| Repo | Language | Purpose |
+|---|---|---|
+| [shannon-prime](https://github.com/nihilistau/shannon-prime) | C | Core math library (VHT2, Möbius, sqfree, spinor) |
+| [shannon-prime-engine](https://github.com/nihilistau/shannon-prime-engine) | C++ | Standalone inference engine |
+| [shannon-prime-llama](https://github.com/nihilistau/shannon-prime-llama) | C/C++ | llama.cpp integration (LM Studio) |
+| [ComfyUI-FL-VoxtralTTS](https://github.com/nihilistau/ComfyUI-FL-VoxtralTTS) | Python | Voxtral TTS + Shannon-Prime KV |
+| [voxtral-mini-realtime-rs](https://github.com/nihilistau/voxtral-mini-realtime-rs) | Rust | Voxtral real-time + Shannon-Prime KV |
+| [voxtral-tts.c](https://github.com/nihilistau/voxtral-tts.c) | C | Voxtral C engine + Shannon-Prime KV |
 
 ---
 

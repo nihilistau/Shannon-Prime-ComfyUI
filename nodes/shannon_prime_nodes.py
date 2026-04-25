@@ -403,12 +403,12 @@ class ShannonPrimeWanCache:
         return {
             "required": {
                 "model": ("MODEL",),
-                "k_bits": ("STRING", {"default": "5,4,4,3",
-                                      "tooltip": "K band bit allocation (4 bands)"}),
-                "v_bits": ("STRING", {"default": "5,4,4,3",
-                                      "tooltip": "V band bit allocation (4 bands for cross-attn, unlike self-attn flat 3-bit)"}),
-                "use_mobius": ("BOOLEAN", {"default": True,
-                                           "tooltip": "Möbius squarefree-first reorder on both K and V (cross-attn has no RoPE)"}),
+                "k_bits": ("STRING", {"default": "4,3,3,3",
+                                      "tooltip": "K band bit allocation (4 bands). Ignored in LEAN mode (raw CPU cache). Used when cache_compress=vht2."}),
+                "v_bits": ("STRING", {"default": "4,3,3,3",
+                                      "tooltip": "V band bit allocation. Ignored in LEAN mode. Used when cache_compress=vht2."}),
+                "use_mobius": ("BOOLEAN", {"default": False,
+                                           "tooltip": "Möbius squarefree-first reorder. Default OFF — LEAN mode uses raw CPU cache. Enable with cache_compress=vht2 if desired."}),
             },
         }
 
@@ -438,9 +438,9 @@ class ShannonPrimeWanCache:
             if _wrap_cross_attn(getattr(blk, "cross_attn", None), i):
                 wrapped += 1
 
-        print(f"[Shannon-Prime] Phase 15 LEAN — patched {wrapped}/{len(blocks)} "
+        print(f"[Shannon-Prime] Phase 16 LEAN — patched {wrapped}/{len(blocks)} "
               f"Wan cross-attn linears with raw CPU/fp16 caching")
-        print(f"[Shannon-Prime] No VHT2, no Möbius, no GPU temporaries — "
+        print(f"[Shannon-Prime] Möbius OFF, raw CPU cache — "
               f"zero VRAM overhead on cache hit")
 
         return (patched,)

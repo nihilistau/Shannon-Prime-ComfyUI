@@ -32,7 +32,7 @@ _THIS_DIR = pathlib.Path(__file__).resolve().parent
 _REPO_ROOT = _THIS_DIR.parent
 _SP_TOOLS = _REPO_ROOT / "lib" / "shannon-prime" / "tools"
 _SP_TORCH = _REPO_ROOT / "lib" / "shannon-prime" / "backends" / "torch"
-for p in (_SP_TOOLS, _SP_TORCH):
+for p in (_THIS_DIR, _SP_TOOLS, _SP_TORCH):
     s = str(p)
     if s not in sys.path:
         sys.path.insert(0, s)

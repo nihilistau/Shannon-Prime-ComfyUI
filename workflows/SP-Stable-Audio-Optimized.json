@@ -1,8 +1,8 @@
 {
-  "id": "sp-stable-audio-opt-001",
-  "revision": 1,
-  "last_node_id": 9,
-  "last_link_id": 10,
+  "id": "sp-stable-audio-opt-003",
+  "revision": 3,
+  "last_node_id": 11,
+  "last_link_id": 16,
   "nodes": [
     {
       "id": 1,
@@ -23,7 +23,7 @@
         {
           "name": "CLIP",
           "type": "CLIP",
-          "links": [2, 10],
+          "links": [],
           "slot_index": 1
         },
         {
@@ -37,12 +37,33 @@
       "widgets_values": ["stable_audio_open_1.0.safetensors"]
     },
     {
+      "id": 11,
+      "type": "CLIPLoader",
+      "pos": [100, 380],
+      "size": [300, 80],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "links": [15, 16],
+          "slot_index": 0
+        }
+      ],
+      "title": "T5-Base Text Encoder (Stable Audio)",
+      "properties": {},
+      "widgets_values": ["t5_base_stable_audio.safetensors", "stable_audio"]
+    },
+    {
       "id": 2,
       "type": "ShannonPrimeAudioBlockSkip",
       "pos": [460, 200],
       "size": [320, 280],
       "flags": {},
-      "order": 1,
+      "order": 2,
       "mode": 0,
       "inputs": [
         {
@@ -69,20 +90,20 @@
       "pos": [460, 540],
       "size": [320, 100],
       "flags": {},
-      "order": 2,
+      "order": 3,
       "mode": 0,
       "inputs": [
         {
           "name": "clip",
           "type": "CLIP",
-          "link": 2
+          "link": 15
         }
       ],
       "outputs": [
         {
           "name": "CONDITIONING",
           "type": "CONDITIONING",
-          "links": [4],
+          "links": [12],
           "slot_index": 0
         }
       ],
@@ -95,20 +116,20 @@
       "pos": [460, 700],
       "size": [320, 80],
       "flags": {},
-      "order": 3,
+      "order": 4,
       "mode": 0,
       "inputs": [
         {
           "name": "clip",
           "type": "CLIP",
-          "link": 10
+          "link": 16
         }
       ],
       "outputs": [
         {
           "name": "CONDITIONING",
           "type": "CONDITIONING",
-          "links": [11],
+          "links": [13],
           "slot_index": 0
         }
       ],
@@ -116,12 +137,50 @@
       "widgets_values": [""]
     },
     {
+      "id": 10,
+      "type": "ConditioningStableAudio",
+      "pos": [840, 540],
+      "size": [320, 120],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 12
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 13
+        }
+      ],
+      "outputs": [
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "links": [4],
+          "slot_index": 0
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "links": [14],
+          "slot_index": 1
+        }
+      ],
+      "title": "Conditioning Stable Audio",
+      "properties": {},
+      "widgets_values": [0.0, 47.6]
+    },
+    {
       "id": 4,
       "type": "EmptyLatentAudio",
       "pos": [460, 830],
       "size": [300, 80],
       "flags": {},
-      "order": 4,
+      "order": 6,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -138,10 +197,10 @@
     {
       "id": 5,
       "type": "KSampler",
-      "pos": [860, 200],
+      "pos": [1220, 200],
       "size": [300, 340],
       "flags": {},
-      "order": 5,
+      "order": 7,
       "mode": 0,
       "inputs": [
         {
@@ -157,7 +216,7 @@
         {
           "name": "negative",
           "type": "CONDITIONING",
-          "link": 11
+          "link": 14
         },
         {
           "name": "latent_image",
@@ -179,10 +238,10 @@
     {
       "id": 6,
       "type": "ShannonPrimeAudioCacheFlush",
-      "pos": [860, 600],
+      "pos": [1220, 600],
       "size": [300, 50],
       "flags": {},
-      "order": 6,
+      "order": 8,
       "mode": 0,
       "inputs": [
         {
@@ -205,10 +264,10 @@
     {
       "id": 7,
       "type": "VAEDecodeAudio",
-      "pos": [1220, 300],
+      "pos": [1580, 300],
       "size": [260, 80],
       "flags": {},
-      "order": 7,
+      "order": 9,
       "mode": 0,
       "inputs": [
         {
@@ -235,10 +294,10 @@
     {
       "id": 8,
       "type": "PreviewAudio",
-      "pos": [1220, 440],
+      "pos": [1580, 440],
       "size": [260, 50],
       "flags": {},
-      "order": 8,
+      "order": 10,
       "mode": 0,
       "inputs": [
         {
@@ -254,21 +313,23 @@
   ],
   "links": [
     [1, 1, 0, 2, 0, "MODEL"],
-    [2, 1, 1, 3, 0, "CLIP"],
     [3, 2, 0, 5, 0, "MODEL"],
-    [4, 3, 0, 5, 1, "CONDITIONING"],
+    [4, 10, 0, 5, 1, "CONDITIONING"],
     [5, 4, 0, 5, 3, "LATENT"],
     [6, 5, 0, 6, 0, "LATENT"],
     [7, 1, 2, 7, 1, "VAE"],
     [8, 6, 0, 7, 0, "LATENT"],
     [9, 7, 0, 8, 0, "AUDIO"],
-    [10, 1, 1, 9, 0, "CLIP"],
-    [11, 9, 0, 5, 2, "CONDITIONING"]
+    [12, 3, 0, 10, 0, "CONDITIONING"],
+    [13, 9, 0, 10, 1, "CONDITIONING"],
+    [14, 10, 1, 5, 2, "CONDITIONING"],
+    [15, 11, 0, 3, 0, "CLIP"],
+    [16, 11, 0, 9, 0, "CLIP"]
   ],
   "groups": [
     {
       "title": "Shannon-Prime: Stable Audio with VHT2 Block-Skip",
-      "bounding": [60, 100, 1460, 800],
+      "bounding": [60, 100, 1820, 800],
       "color": "#3f789e"
     }
   ],
@@ -280,7 +341,7 @@
     },
     "info": {
       "name": "SP-Stable-Audio-Optimized",
-      "description": "Stable Audio generation with Shannon-Prime Audio Block-Skip. 24-layer DiT with tier-based caching: tonal foundation (8), harmonic mid (3), transient detail (off)."
+      "description": "Stable Audio generation with Shannon-Prime Audio Block-Skip. Uses separate CLIPLoader with T5-base (768-dim) for text encoding since the checkpoint has no embedded text encoder. 24-layer DiT with tier-based caching."
     }
   },
   "version": 0.4

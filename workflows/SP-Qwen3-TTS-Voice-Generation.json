@@ -1,0 +1,167 @@
+{
+  "id": "sp-qwen3-tts-voice-001",
+  "revision": 0,
+  "last_node_id": 6,
+  "last_link_id": 5,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "Qwen3Loader",
+      "pos": [100, 200],
+      "size": [320, 130],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "QWEN3_MODEL",
+          "links": [1, 2],
+          "slot_index": 0
+        }
+      ],
+      "properties": {},
+      "widgets_values": [
+        "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        "HuggingFace",
+        "bf16",
+        "auto",
+        ""
+      ]
+    },
+    {
+      "id": 2,
+      "type": "Qwen3CustomVoice",
+      "pos": [500, 100],
+      "size": [350, 220],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "QWEN3_MODEL",
+          "link": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "links": [3],
+          "slot_index": 0
+        }
+      ],
+      "title": "Voice A — Narrator",
+      "properties": {},
+      "widgets_values": [
+        "Welcome to Shannon-Prime. This demonstration shows real-time voice synthesis powered by the Qwen3 text-to-speech model, generating natural speech at twelve tokens per second.",
+        "English",
+        "Dylan",
+        42,
+        "",
+        "",
+        2048
+      ]
+    },
+    {
+      "id": 3,
+      "type": "Qwen3CustomVoice",
+      "pos": [500, 380],
+      "size": [350, 220],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "QWEN3_MODEL",
+          "link": 2
+        }
+      ],
+      "outputs": [
+        {
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "links": [4],
+          "slot_index": 0
+        }
+      ],
+      "title": "Voice B — Response",
+      "properties": {},
+      "widgets_values": [
+        "That's incredible. The system uses a hierarchical prediction scheme where the backbone predicts the primary codebook, and a multi-token prediction module generates all residual codebooks simultaneously.",
+        "English",
+        "Vivian",
+        123,
+        "",
+        "",
+        2048
+      ]
+    },
+    {
+      "id": 4,
+      "type": "PreviewAudio",
+      "pos": [920, 100],
+      "size": [260, 50],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 3
+        }
+      ],
+      "outputs": [],
+      "title": "Preview Voice A",
+      "properties": {}
+    },
+    {
+      "id": 5,
+      "type": "PreviewAudio",
+      "pos": [920, 380],
+      "size": [260, 50],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 4
+        }
+      ],
+      "outputs": [],
+      "title": "Preview Voice B",
+      "properties": {}
+    }
+  ],
+  "links": [
+    [1, 1, 0, 2, 0, "QWEN3_MODEL"],
+    [2, 1, 0, 3, 0, "QWEN3_MODEL"],
+    [3, 2, 0, 4, 0, "AUDIO"],
+    [4, 3, 0, 5, 0, "AUDIO"]
+  ],
+  "groups": [
+    {
+      "title": "Shannon-Prime: Qwen3-TTS Voice Generation",
+      "bounding": [60, 40, 1160, 620],
+      "color": "#3f789e"
+    }
+  ],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 1,
+      "offset": [0, 0]
+    },
+    "info": {
+      "name": "SP-Qwen3-TTS-Voice-Generation",
+      "description": "Shannon-Prime voice generation using Qwen3-TTS. Dual-speaker demonstration with narrator and response voices."
+    }
+  },
+  "version": 0.4
+}

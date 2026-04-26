@@ -77,10 +77,70 @@ VOXTRAL_TAIL_COMBOS = [
     ("vox-ternary-tail",{"k_band_bits": "5,5,4,3", "k_ternary_bands": "3"}),
 ]
 
+# ── V2 presets ──────────────────────────────────────────────────────────
+# Each piece independently to identify deltas, then combinations.
+# All v1 toggles assumed at their best-known config (drift-gate + sigma-streak ON).
+
+WAN_V2_CORE_COMBOS = [
+    ("v2-baseline",
+        {"enable_drift_gate": True, "enable_sigma_streak": True}),
+    ("v2-harmonic",
+        {"enable_drift_gate": True, "enable_sigma_streak": True,
+         "enable_harmonic_correction": True, "harmonic_strength": 0.5}),
+    ("v2-curvature",
+        {"enable_drift_gate": True, "enable_sigma_streak": True,
+         "enable_curvature_gate": True}),
+    ("v2-cauchy",
+        {"enable_drift_gate": True, "enable_sigma_streak": True,
+         "enable_cauchy_reset": True, "cauchy_radius": 2}),
+    ("v2-curv+cauchy",
+        {"enable_drift_gate": True, "enable_sigma_streak": True,
+         "enable_curvature_gate": True,
+         "enable_cauchy_reset": True, "cauchy_radius": 2}),
+    ("v2-all-on-raw",
+        {"enable_drift_gate": True, "enable_sigma_streak": True,
+         "enable_harmonic_correction": True, "harmonic_strength": 0.5,
+         "enable_curvature_gate": True,
+         "enable_cauchy_reset": True, "cauchy_radius": 2}),
+]
+
+WAN_V2_VHT2_COMBOS = [
+    ("v2-vht2-baseline",
+        {"cache_compress": "vht2",
+         "enable_drift_gate": True, "enable_sigma_streak": True,
+         "enable_twin_borrow": True}),
+    ("v2-vht2-tier-skel",
+        {"cache_compress": "vht2",
+         "enable_drift_gate": True, "enable_sigma_streak": True,
+         "enable_twin_borrow": True,
+         "enable_tier_skeleton": True,
+         "granite_skel_frac": 0.50, "sand_skel_frac": 0.30, "jazz_skel_frac": 0.20}),
+    ("v2-vht2-twin-low-anchor",
+        {"cache_compress": "vht2",
+         "enable_drift_gate": True, "enable_sigma_streak": True,
+         "enable_twin_borrow": True, "twin_borrow_mode": "low_anchor"}),
+    ("v2-vht2-twin-high-anchor",
+        {"cache_compress": "vht2",
+         "enable_drift_gate": True, "enable_sigma_streak": True,
+         "enable_twin_borrow": True, "twin_borrow_mode": "high_anchor"}),
+    ("v2-vht2-all-on",
+        {"cache_compress": "vht2",
+         "enable_drift_gate": True, "enable_sigma_streak": True,
+         "enable_twin_borrow": True, "twin_borrow_mode": "low_anchor",
+         "enable_harmonic_correction": True, "harmonic_strength": 0.5,
+         "enable_tier_skeleton": True,
+         "granite_skel_frac": 0.50, "sand_skel_frac": 0.30, "jazz_skel_frac": 0.20,
+         "enable_curvature_gate": True,
+         "enable_cauchy_reset": True, "cauchy_radius": 2}),
+]
+
 PRESETS = {
     "wan-core":     WAN_CORE_COMBOS,
     "wan-vht2":     WAN_VHT2_COMBOS,
     "wan-full":     WAN_CORE_COMBOS + WAN_VHT2_COMBOS,
+    "wan-v2-core":  WAN_V2_CORE_COMBOS,
+    "wan-v2-vht2":  WAN_V2_VHT2_COMBOS,
+    "wan-v2-full":  WAN_V2_CORE_COMBOS + WAN_V2_VHT2_COMBOS,
     "voxtral-tail": VOXTRAL_TAIL_COMBOS,
 }
 
@@ -93,6 +153,9 @@ COMBO_TARGET_NODE = {
     "wan-core":     "ShannonPrimeWanBlockSkip",
     "wan-vht2":     "ShannonPrimeWanBlockSkip",
     "wan-full":     "ShannonPrimeWanBlockSkip",
+    "wan-v2-core":  "ShannonPrimeWanBlockSkip",
+    "wan-v2-vht2":  "ShannonPrimeWanBlockSkip",
+    "wan-v2-full":  "ShannonPrimeWanBlockSkip",
     "voxtral-tail": "ShannonPrimeVoxtralKVCache",
 }
 

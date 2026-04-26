@@ -1119,6 +1119,16 @@ class ShannonPrimeWanBlockSkip:
                     "tooltip": "Skeleton fraction for tier-1 (L04-L08). Default 0.30 = current uniform."}),
                 "jazz_skel_frac": ("FLOAT", {"default": 0.20, "min": 0.05, "max": 1.0, "step": 0.05,
                     "tooltip": "Skeleton fraction for tier-2/3 (L09+). Lower = more aggressive. Default 0.20 vs uniform 0.30."}),
+                # ── v2 piece 4/7: Fisher-Hessian curvature gate ──────────
+                # Tracks second derivative of rolling cos_sim. If sim is
+                # accelerating downward (rate-of-decline increasing), force
+                # a miss earlier than the static threshold would. Catches
+                # "about to fall off the attractor" before cos_sim itself
+                # drops below threshold.
+                "enable_curvature_gate": ("BOOLEAN", {"default": False,
+                    "tooltip": "Force a miss when rolling_sim acceleration goes below curvature_threshold (sim is rapidly accelerating downward). Layered on top of the static drift gate."}),
+                "curvature_threshold": ("FLOAT", {"default": -0.05, "min": -0.30, "max": 0.0, "step": 0.01,
+                    "tooltip": "Min acceleration. -0.05 = sim's rate-of-decline jumped by 5pp between miss steps."}),
                 "verbose": ("BOOLEAN", {"default": False,
                     "tooltip": "Print per-block HIT/MISS logs + Fisher cos_sim + Partition Z proxy"}),
             },
@@ -1140,6 +1150,7 @@ class ShannonPrimeWanBlockSkip:
               enable_harmonic_correction=False, harmonic_strength=0.5,
               enable_tier_skeleton=False,
               granite_skel_frac=0.50, sand_skel_frac=0.30, jazz_skel_frac=0.20,
+              enable_curvature_gate=False, curvature_threshold=-0.05,
               verbose=False, **_ignored):
         import types
         import comfy.model_management
@@ -1271,6 +1282,8 @@ class ShannonPrimeWanBlockSkip:
             'fisher_sim':     {},       # block_idx -> last Fisher cos_sim (diagnostic)
             'rolling_sim':    {},       # block_idx -> EMA of fisher cos_sim across misses
             'prev_attn_cache':{},       # block_idx -> previous miss's y (for harmonic correction)
+            'delta_sim':      {},       # v2 piece 4: last (rolling - prev_rolling) per block
+            'curvature_violation': {},  # v2 piece 4: per-block flag set when accel < threshold
         }
 
         # ── Tier-aware drift threshold (strange-attractor stack) ─────────
@@ -1424,13 +1437,23 @@ class ShannonPrimeWanBlockSkip:
                 else:
                     drift_ok = True
 
+                # v2 piece 4/7: curvature gate. If the most-recent miss
+                # measured a strong negative acceleration in rolling_sim,
+                # the trajectory is leaving the basin — deny the next hit
+                # to force a refresh ahead of an actual threshold breach.
+                if enable_curvature_gate:
+                    curvature_ok = not state['curvature_violation'].get(block_idx, False)
+                else:
+                    curvature_ok = True
+
                 # ── CACHE HIT ──────────────────────────────────────────────
                 _streak_limit = _current_streak_limit()
                 hit = (cached_y is not None
                        and cached_xa is not None
                        and age >= 0 and age < window
                        and streak < _streak_limit
-                       and drift_ok)
+                       and drift_ok
+                       and curvature_ok)
 
                 # ── Helpers: store/load with per-block dtype ──��───────────
                 _blk_dtype = _dtype_for(block_idx)
@@ -1551,14 +1574,26 @@ class ShannonPrimeWanBlockSkip:
                     # ~2-step memory: enough to filter single-step blips but
                     # responsive enough to catch a real attractor escape.
                     prev_y = state['attn_cache'].get(block_idx)
-                    if prev_y is not None and (verbose or enable_drift_gate):
+                    if prev_y is not None and (verbose or enable_drift_gate or enable_curvature_gate):
                         prev_on_dev = _load(prev_y)
                         f_sim = _fisher_cos_sim(y, prev_on_dev, _fisher_w)
                         state['fisher_sim'][block_idx] = f_sim
-                        if enable_drift_gate:
+                        if enable_drift_gate or enable_curvature_gate:
                             prev_rolling = state['rolling_sim'].get(block_idx, 1.0)
-                            state['rolling_sim'][block_idx] = (
-                                0.5 * prev_rolling + 0.5 * f_sim)
+                            new_rolling = 0.5 * prev_rolling + 0.5 * f_sim
+                            state['rolling_sim'][block_idx] = new_rolling
+
+                            # v2 piece 4: track second derivative (acceleration)
+                            if enable_curvature_gate:
+                                curr_delta = new_rolling - prev_rolling
+                                prev_delta = state['delta_sim'].get(block_idx, 0.0)
+                                accel = curr_delta - prev_delta
+                                state['delta_sim'][block_idx] = curr_delta
+                                # Negative accel below threshold = sim accelerating
+                                # downward = trajectory escaping basin. Set flag
+                                # so next hit decision denies the hit.
+                                state['curvature_violation'][block_idx] = (
+                                    accel < curvature_threshold)
                         del prev_on_dev
 
                     # v2 piece 1/5: capture prev y before overwriting,
@@ -1677,6 +1712,9 @@ class ShannonPrimeWanBlockSkip:
             print(f"[SP BlockSkip] Tier-aware skeleton ON: "
                   f"granite={granite_skel_frac:.0%}, sand={sand_skel_frac:.0%}, "
                   f"jazz={jazz_skel_frac:.0%}")
+        if enable_curvature_gate:
+            print(f"[SP BlockSkip] Curvature gate ON: threshold={curvature_threshold:+.3f} "
+                  f"(force miss when sim acceleration drops below)")
         if verbose:
             print(f"[SP BlockSkip] Verbose: Fisher cos_sim + Partition Z proxy logging enabled")
 

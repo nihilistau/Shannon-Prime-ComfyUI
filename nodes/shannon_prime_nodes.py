@@ -1191,6 +1191,14 @@ class ShannonPrimeWanBlockSkip:
                     "tooltip": "When a drift- or curvature-induced miss fires, also invalidate ±cauchy_radius neighbor blocks within the same tier."}),
                 "cauchy_radius": ("INT", {"default": 2, "min": 0, "max": 10,
                     "tooltip": "Block-index radius for the reset. 0=no neighbors, 2=±2 same-tier neighbors, etc."}),
+                # ── v2 piece 7/7: foveated mask input ────────────────────
+                # Optional MASK that biases the gates toward stricter behavior
+                # when a subject of interest is identified. v1 uses scalar
+                # coverage: tighter thresholds + shorter streaks proportional
+                # to mask coverage. Per-token application is the next step.
+                "subject_mask": ("MASK", ),
+                "subject_focus_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "How much to tighten gates when subject_mask is provided. 0=ignore mask, 0.5=moderate, 1.0=aggressive."}),
                 "verbose": ("BOOLEAN", {"default": False,
                     "tooltip": "Print per-block HIT/MISS logs + Fisher cos_sim + Partition Z proxy"}),
             },
@@ -1214,6 +1222,7 @@ class ShannonPrimeWanBlockSkip:
               granite_skel_frac=0.50, sand_skel_frac=0.30, jazz_skel_frac=0.20,
               enable_curvature_gate=False, curvature_threshold=-0.05,
               enable_cauchy_reset=False, cauchy_radius=2,
+              subject_mask=None, subject_focus_strength=0.5,
               verbose=False, **_ignored):
         import types
         import comfy.model_management
@@ -1349,6 +1358,25 @@ class ShannonPrimeWanBlockSkip:
             'curvature_violation': {},  # v2 piece 4: per-block flag set when accel < threshold
         }
 
+        # ── v2 piece 7/7: foveated mask coverage ─────────────────────────
+        # Compute scalar coverage from the optional MASK input. When provided
+        # and non-trivial, the coverage scales the per-tier drift thresholds
+        # upward (stricter), causing more eager refreshes during subject-heavy
+        # frames. v1 = scalar; per-token application is the natural follow-up.
+        _subject_coverage = 0.0
+        if subject_mask is not None and subject_focus_strength > 0.0:
+            try:
+                if hasattr(subject_mask, 'float'):
+                    m = subject_mask.float()
+                    _subject_coverage = float(m.mean().item())
+                # Cap to [0, 1]
+                _subject_coverage = max(0.0, min(1.0, _subject_coverage))
+            except Exception:
+                _subject_coverage = 0.0
+
+        # Threshold boost = focus_strength * coverage * 0.05 (max +5pp tighter)
+        _subject_boost = subject_focus_strength * _subject_coverage * 0.05
+
         # ── Tier-aware drift threshold (strange-attractor stack) ─────────
         # Returns the minimum rolling cos_sim required to allow a cache hit.
         # Granite (L00-L03) cos_sim parks at 0.999+ across many steps, so it
@@ -1356,10 +1384,13 @@ class ShannonPrimeWanBlockSkip:
         # a stricter one. Used only when enable_drift_gate=True.
         def _tier_threshold(i):
             if i < 4:
-                return granite_threshold
-            if i < 9:
-                return sand_threshold
-            return jazz_threshold
+                base = granite_threshold
+            elif i < 9:
+                base = sand_threshold
+            else:
+                base = jazz_threshold
+            # v2 piece 7/7: subject mask tightens the threshold
+            return min(0.999, base + _subject_boost)
 
         # ── v2 piece 5/7: Cauchy reset helper ────────────────────────────
         # When a drift/curvature gate forces a miss on block triggering, also
@@ -1823,6 +1854,10 @@ class ShannonPrimeWanBlockSkip:
         if enable_cauchy_reset:
             print(f"[SP BlockSkip] Cauchy reset ON: radius={cauchy_radius} "
                   f"(invalidate ±{cauchy_radius} same-tier neighbors on gated miss)")
+        if subject_mask is not None and _subject_coverage > 0.0:
+            print(f"[SP BlockSkip] Subject mask: coverage={_subject_coverage:.1%} "
+                  f"strength={subject_focus_strength:.2f} → "
+                  f"+{_subject_boost*100:.1f}pp threshold boost on all tiers")
         if verbose:
             print(f"[SP BlockSkip] Verbose: Fisher cos_sim + Partition Z proxy logging enabled")
 

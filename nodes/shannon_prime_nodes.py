@@ -1025,6 +1025,22 @@ class ShannonPrimeWanBlockSkip:
                     "tooltip": "fp16=all caches fp16. fp8=all fp8. mixed=tier-0/1 fp16 (precision), tier-2/3 fp8 (saves memory where approximation is already aggressive)."}),
                 "cache_compress": (["raw", "vht2"], {"default": "raw",
                     "tooltip": "raw=store cached tensors as-is (default, safe). vht2=VHT2 spectral compression via pre-allocated memory pool (~3.5x memory reduction, ~0 quality loss). Pool eliminates the VRAM fragmentation that disabled VHT2 in Phase 15 LEAN."}),
+                # ── Strange-attractor stack — gated, default OFF ─────────
+                # Wires the rolling Fisher cos_sim into the cache-hit gate.
+                # Currently the docstring promises this but the gate is age+streak only.
+                # When enabled, each block tracks an EMA of measured cos_sim across
+                # misses; the next hit is allowed only if rolling_sim >= tier threshold.
+                # Tier thresholds default to the values implied by the existing streak
+                # limits (granite>0.95, sand>0.90, jazz>0.85), so behavior is conservative.
+                # Loosen granite to extend streaks; tighten jazz to refresh more eagerly.
+                "enable_drift_gate": ("BOOLEAN", {"default": False,
+                    "tooltip": "Strange-attractor stack: gate cache hits by rolling Fisher cos_sim. OFF = current age+streak only behavior (default, ship-safe)."}),
+                "granite_threshold": ("FLOAT", {"default": 0.95, "min": 0.50, "max": 1.00, "step": 0.01,
+                    "tooltip": "Min rolling cos_sim to allow cache hit on tier-0 (L00-L03). Lower = looser leash, longer streaks. Only used when enable_drift_gate=True."}),
+                "sand_threshold": ("FLOAT", {"default": 0.90, "min": 0.50, "max": 1.00, "step": 0.01,
+                    "tooltip": "Min rolling cos_sim for tier-1 (L04-L08). Only used when enable_drift_gate=True."}),
+                "jazz_threshold": ("FLOAT", {"default": 0.85, "min": 0.50, "max": 1.00, "step": 0.01,
+                    "tooltip": "Min rolling cos_sim for tier-2/3 (L09+). Only used when enable_drift_gate=True."}),
                 "verbose": ("BOOLEAN", {"default": False,
                     "tooltip": "Print per-block HIT/MISS logs + Fisher cos_sim + Partition Z proxy"}),
             },
@@ -1038,6 +1054,8 @@ class ShannonPrimeWanBlockSkip:
               tier_2_window=0, tier_3_window=0,
               cache_ffn=False, cache_dtype="fp16",
               cache_compress="raw",
+              enable_drift_gate=False,
+              granite_threshold=0.95, sand_threshold=0.90, jazz_threshold=0.85,
               verbose=False, **_ignored):
         import types
         import comfy.model_management
@@ -1143,7 +1161,20 @@ class ShannonPrimeWanBlockSkip:
             'ffn_cache':      {},       # block_idx -> FFN pre-gate y (CPU fp16) [turbo]
             'step_cached':    {},
             'fisher_sim':     {},       # block_idx -> last Fisher cos_sim (diagnostic)
+            'rolling_sim':    {},       # block_idx -> EMA of fisher cos_sim across misses
         }
+
+        # ── Tier-aware drift threshold (strange-attractor stack) ─────────
+        # Returns the minimum rolling cos_sim required to allow a cache hit.
+        # Granite (L00-L03) cos_sim parks at 0.999+ across many steps, so it
+        # tolerates a looser threshold; jazz (L16+) is volatile and warrants
+        # a stricter one. Used only when enable_drift_gate=True.
+        def _tier_threshold(i):
+            if i < 4:
+                return granite_threshold
+            if i < 9:
+                return sand_threshold
+            return jazz_threshold
 
         def make_patched_forward(orig_forward, block_idx, blk):
             window = get_window(block_idx)
@@ -1203,11 +1234,23 @@ class ShannonPrimeWanBlockSkip:
                     cached_xa = None
                     cached_ff = None
 
+                # ── Drift gate (strange-attractor stack) ────────────────────
+                # When enabled, the rolling Fisher cos_sim must clear the
+                # tier-specific threshold for a hit to be allowed. The rolling
+                # value is seeded at 1.0 (full coherence), so the gate is a
+                # no-op until the first miss measures actual drift.
+                if enable_drift_gate:
+                    rolling = state['rolling_sim'].get(block_idx, 1.0)
+                    drift_ok = (rolling >= _tier_threshold(block_idx))
+                else:
+                    drift_ok = True
+
                 # ── CACHE HIT ──────────────────────────────────────────────
                 hit = (cached_y is not None
                        and cached_xa is not None
                        and age >= 0 and age < window
-                       and streak < _streak_limit)
+                       and streak < _streak_limit
+                       and drift_ok)
 
                 # ── Helpers: store/load with per-block dtype ──��───────────
                 _blk_dtype = _dtype_for(block_idx)
@@ -1291,11 +1334,21 @@ class ShannonPrimeWanBlockSkip:
                     # Fisher diagonal approximation. This measures "information
                     # drift" — drift along the arithmetical skeleton dimensions
                     # weighted higher than noise dimensions.
+                    #
+                    # When enable_drift_gate is on, this measurement is always-on
+                    # (not just verbose) and feeds the EMA-smoothed rolling_sim
+                    # used to gate the next step's hit decision. EMA α=0.5 gives
+                    # ~2-step memory: enough to filter single-step blips but
+                    # responsive enough to catch a real attractor escape.
                     prev_y = state['attn_cache'].get(block_idx)
-                    if prev_y is not None and verbose:
+                    if prev_y is not None and (verbose or enable_drift_gate):
                         prev_on_dev = _load(prev_y)
                         f_sim = _fisher_cos_sim(y, prev_on_dev, _fisher_w)
                         state['fisher_sim'][block_idx] = f_sim
+                        if enable_drift_gate:
+                            prev_rolling = state['rolling_sim'].get(block_idx, 1.0)
+                            state['rolling_sim'][block_idx] = (
+                                0.5 * prev_rolling + 0.5 * f_sim)
                         del prev_on_dev
 
                     state['attn_cache'][block_idx] = _store(y)
@@ -1384,6 +1437,10 @@ class ShannonPrimeWanBlockSkip:
             print(f"[SP BlockSkip] TURBO: on HIT, ENTIRE block skipped (adaLN + 3 transfers)")
         else:
             print(f"[SP BlockSkip] On HIT: adaLN + FFN. Self-attn + cross-attn SKIPPED.")
+        if enable_drift_gate:
+            print(f"[SP BlockSkip] Drift gate ON: granite>={granite_threshold:.2f} "
+                  f"sand>={sand_threshold:.2f} jazz>={jazz_threshold:.2f} "
+                  f"(rolling Fisher cos_sim, EMA α=0.5)")
         if verbose:
             print(f"[SP BlockSkip] Verbose: Fisher cos_sim + Partition Z proxy logging enabled")
 

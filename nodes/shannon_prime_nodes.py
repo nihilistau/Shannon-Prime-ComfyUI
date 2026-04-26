@@ -98,22 +98,52 @@ def _fisher_cos_sim(a: torch.Tensor, b: torch.Tensor,
                     weights: torch.Tensor) -> float:
     """
     Fisher-weighted cosine similarity between two tensors.
-    a, b: [..., head_dim] on any device/dtype.
-    weights: [head_dim] float32 on CPU (broadcast to device on first call).
+
+    Accepts either [..., head_dim] (already split into heads) or
+    [..., hidden_dim] where hidden_dim = num_heads * head_dim. In the
+    latter case (the actual self-attn output shape in Wan blocks: e.g.
+    [B, S, 5120] = 40 heads × 128 head_dim), the last axis is reshaped
+    into [..., num_heads, head_dim] before the weighted multiply so the
+    [head_dim] weight vector broadcasts correctly.
+
+    weights: [head_dim] float32 (CPU; moved to a's device on first call).
 
     Returns scalar float cos_sim weighted by the Fisher diagonal.
+
+    Bug history: prior to feat/strange-attractor-stack the function only
+    fired when verbose=True, where the caller had already arranged the
+    head split. The drift gate makes this always-on and feeds the
+    pre-split [B, S, hidden_dim] tensor; the reshape below is the fix.
     """
-    # Flatten to 2D for simplicity (batch*tokens, head_dim)
-    a_flat = a.reshape(-1, a.shape[-1]).float()
-    b_flat = b.reshape(-1, b.shape[-1]).float()
+    head_dim = int(weights.shape[0])
+    last = a.shape[-1]
+    if last == head_dim:
+        a_view = a
+        b_view = b
+    elif last % head_dim == 0:
+        # Split the last axis into (num_heads, head_dim)
+        new_shape_a = a.shape[:-1] + (last // head_dim, head_dim)
+        new_shape_b = b.shape[:-1] + (last // head_dim, head_dim)
+        a_view = a.reshape(*new_shape_a)
+        b_view = b.reshape(*new_shape_b)
+    else:
+        # Fallback: weights aren't applicable to this layout. Plain cos_sim.
+        af = a.reshape(-1).float()
+        bf = b.reshape(-1).float()
+        na, nb = af.norm(), bf.norm()
+        if na < 1e-12 or nb < 1e-12:
+            return 0.0
+        return float((af * bf).sum() / (na * nb))
+
+    # Flatten everything except the head_dim axis
+    a_flat = a_view.reshape(-1, head_dim).float()
+    b_flat = b_view.reshape(-1, head_dim).float()
 
     w = weights.to(device=a_flat.device)
 
-    # Weighted vectors
     aw = a_flat * w
     bw = b_flat * w
 
-    # Global cos_sim across all elements
     dot = (aw * bw).sum()
     norm_a = aw.norm()
     norm_b = bw.norm()

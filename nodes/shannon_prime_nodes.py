@@ -1041,6 +1041,14 @@ class ShannonPrimeWanBlockSkip:
                     "tooltip": "Min rolling cos_sim for tier-1 (L04-L08). Only used when enable_drift_gate=True."}),
                 "jazz_threshold": ("FLOAT", {"default": 0.85, "min": 0.50, "max": 1.00, "step": 0.01,
                     "tooltip": "Min rolling cos_sim for tier-2/3 (L09+). Only used when enable_drift_gate=True."}),
+                # Piece 2/4: adaptive sigma-streak. At high sigma (composition forming)
+                # streaks stay short; at low sigma (locked composition, texture only)
+                # streaks extend. Cooperates with ShannonPrimeWanSigmaSwitch — reads
+                # the same _sp_sigma_state if present, otherwise installs its own
+                # model_function_wrapper to capture sigma. SVI non-monotonic schedules
+                # are handled by sigma_max/sigma_min rolling min/max.
+                "enable_sigma_streak": ("BOOLEAN", {"default": False,
+                    "tooltip": "Strange-attractor stack: streak limits scale with sigma. Granite extends 7-15, sand 4-9, jazz 3-6 across sigma range. OFF = current static 10/5/3 behavior."}),
                 "verbose": ("BOOLEAN", {"default": False,
                     "tooltip": "Print per-block HIT/MISS logs + Fisher cos_sim + Partition Z proxy"}),
             },
@@ -1056,6 +1064,7 @@ class ShannonPrimeWanBlockSkip:
               cache_compress="raw",
               enable_drift_gate=False,
               granite_threshold=0.95, sand_threshold=0.90, jazz_threshold=0.85,
+              enable_sigma_streak=False,
               verbose=False, **_ignored):
         import types
         import comfy.model_management
@@ -1176,15 +1185,80 @@ class ShannonPrimeWanBlockSkip:
                 return sand_threshold
             return jazz_threshold
 
+        # ── Sigma capture (cooperative with ShannonPrimeWanSigmaSwitch) ──
+        # If SigmaSwitch is upstream it has already populated _sp_sigma_state
+        # with current_sigma / sigma_max / sigma_min. Reuse it. Otherwise
+        # install our own model_function_wrapper to capture the same shape.
+        # Only active when enable_sigma_streak=True (sigma read happens per
+        # step regardless, but streak_limit only scales when the toggle is on).
+        sigma_state = getattr(patched, '_sp_sigma_state', None)
+        if enable_sigma_streak and sigma_state is None:
+            sigma_state = {
+                'current_sigma': [None],
+                'sigma_max':     [None],
+                'sigma_min':     [None],
+                'step_count':    [0],
+            }
+
+            def _sp_blockskip_sigma_wrapper(apply_model_func, args_dict):
+                timestep = args_dict.get("timestep", None)
+                if timestep is not None:
+                    try:
+                        sig = float(timestep.flatten()[0])
+                        sigma_state['current_sigma'][0] = sig
+                        sigma_state['step_count'][0] += 1
+                        if sigma_state['sigma_max'][0] is None:
+                            sigma_state['sigma_max'][0] = sig
+                            sigma_state['sigma_min'][0] = sig
+                        else:
+                            sigma_state['sigma_max'][0] = max(sigma_state['sigma_max'][0], sig)
+                            sigma_state['sigma_min'][0] = min(sigma_state['sigma_min'][0], sig)
+                    except Exception:
+                        pass
+                return apply_model_func(args_dict["input"], args_dict["timestep"],
+                                        **args_dict.get("c", {}))
+
+            patched.set_model_unet_function_wrapper(_sp_blockskip_sigma_wrapper)
+            patched._sp_sigma_state = sigma_state
+
+        # Adaptive streak: at high-sigma end keep short, at low-sigma end extend.
+        # Returns int streak limit given a normalized sigma (1.0=high, 0.0=low).
+        # Per-tier ranges: granite 7-15, sand 4-9, jazz 3-6.
+        # Falls back to static 10/5/3 if sigma_state not yet populated.
+        def _adaptive_streak(i, sigma_norm):
+            if sigma_norm is None:
+                if i < 4: return 10
+                if i < 9: return 5
+                return 3
+            inv = 1.0 - max(0.0, min(1.0, sigma_norm))  # 0.0 at high, 1.0 at low
+            if i < 4:
+                return int(round(7 + 8 * inv))
+            if i < 9:
+                return int(round(4 + 5 * inv))
+            return int(round(3 + 3 * inv))
+
         def make_patched_forward(orig_forward, block_idx, blk):
             window = get_window(block_idx)
             # Streak limit: force a miss every N hits to refresh cache.
+            # Static defaults — overridden per-step when enable_sigma_streak=True.
             if block_idx < 4:
-                _streak_limit = 10    # tier-0: sim>0.95
+                _static_streak_limit = 10    # tier-0: sim>0.95
             elif block_idx < 9:
-                _streak_limit = 5     # tier-1: sim>0.90
+                _static_streak_limit = 5     # tier-1: sim>0.90
             else:
-                _streak_limit = 3     # tier-2: volatile, refresh often
+                _static_streak_limit = 3     # tier-2: volatile, refresh often
+
+            def _current_streak_limit():
+                if not enable_sigma_streak or sigma_state is None:
+                    return _static_streak_limit
+                sig = sigma_state['current_sigma'][0]
+                s_max = sigma_state['sigma_max'][0]
+                s_min = sigma_state['sigma_min'][0]
+                if sig is None or s_max is None or s_min is None:
+                    return _static_streak_limit
+                rng = max(s_max - s_min, 1e-6)
+                sig_norm = (sig - s_min) / rng  # 1.0=high, 0.0=low
+                return _adaptive_streak(block_idx, sig_norm)
 
             def patched_forward(x, e, freqs, context,
                                 context_img_len=257,
@@ -1246,6 +1320,7 @@ class ShannonPrimeWanBlockSkip:
                     drift_ok = True
 
                 # ── CACHE HIT ──────────────────────────────────────────────
+                _streak_limit = _current_streak_limit()
                 hit = (cached_y is not None
                        and cached_xa is not None
                        and age >= 0 and age < window
@@ -1441,6 +1516,11 @@ class ShannonPrimeWanBlockSkip:
             print(f"[SP BlockSkip] Drift gate ON: granite>={granite_threshold:.2f} "
                   f"sand>={sand_threshold:.2f} jazz>={jazz_threshold:.2f} "
                   f"(rolling Fisher cos_sim, EMA α=0.5)")
+        if enable_sigma_streak:
+            owns_wrapper = sigma_state is not None and not hasattr(model, '_sp_sigma_state')
+            src = "own wrapper" if owns_wrapper else "SigmaSwitch upstream"
+            print(f"[SP BlockSkip] Sigma-streak ON: granite 7-15, sand 4-9, jazz 3-6 "
+                  f"across sigma range (sigma source: {src})")
         if verbose:
             print(f"[SP BlockSkip] Verbose: Fisher cos_sim + Partition Z proxy logging enabled")
 

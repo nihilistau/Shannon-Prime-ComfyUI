@@ -1092,6 +1092,8 @@ class ShannonPrimeWanBlockSkip:
                     "tooltip": "Borrow strength. 0=no change, 0.5=full pair average. Bounded change: |Δc| ≤ α/2·|c_i-c_j|."}),
                 "twin_threshold": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
                     "tooltip": "Only borrow when relative |c_i-c_j|/max exceeds this. 0.0=always borrow, 0.1=outliers only."}),
+                "twin_borrow_mode": (["symmetric", "low_anchor", "high_anchor"], {"default": "symmetric",
+                    "tooltip": "v2 piece 3: borrow asymmetry. symmetric=both pull to mean. low_anchor=lower-prime fixed, higher pulls toward it. high_anchor=inverse."}),
                 # ── v2 piece 1/5: harmonic correction on cache hits ──────
                 # Sally as harmonic oscillator near equilibrium: when input
                 # drift is small the trajectory is approximately linear, so a
@@ -1134,6 +1136,7 @@ class ShannonPrimeWanBlockSkip:
               granite_threshold=0.95, sand_threshold=0.90, jazz_threshold=0.85,
               enable_sigma_streak=False,
               enable_twin_borrow=False, twin_alpha=0.10, twin_threshold=0.0,
+              twin_borrow_mode="symmetric",
               enable_harmonic_correction=False, harmonic_strength=0.5,
               enable_tier_skeleton=False,
               granite_skel_frac=0.50, sand_skel_frac=0.30, jazz_skel_frac=0.20,
@@ -1472,7 +1475,8 @@ class ShannonPrimeWanBlockSkip:
                             if enable_twin_borrow:
                                 full = _vht2_bridge.apply_twin_borrow(
                                     full, _block_skel_mask,
-                                    alpha=twin_alpha, threshold=twin_threshold)
+                                    alpha=twin_alpha, threshold=twin_threshold,
+                                    mode=twin_borrow_mode)
                             recon = _vht2_bridge.forward(full)  # inverse
                             return recon.to(device=x.device, dtype=x.dtype)
                         except Exception:
@@ -1662,7 +1666,8 @@ class ShannonPrimeWanBlockSkip:
         if enable_twin_borrow:
             if _use_vht2:
                 print(f"[SP BlockSkip] Twin-prime borrow ON: α={twin_alpha:.2f} "
-                      f"threshold={twin_threshold:.2f} (decode-only, 9 disjoint pairs)")
+                      f"threshold={twin_threshold:.2f} mode={twin_borrow_mode} "
+                      f"(decode-only, 9 disjoint pairs)")
             else:
                 print(f"[SP BlockSkip] Twin-prime borrow requested but cache_compress=raw — no-op")
         if enable_harmonic_correction:

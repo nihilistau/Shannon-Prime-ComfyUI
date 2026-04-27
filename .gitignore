@@ -6,3 +6,6 @@ Thumbs.db
 
 # Internal templates not for the published repo
 COPYRIGHT_HEADER.txt
+snapshots/
+ablation_*.csv
+ablation_*.md

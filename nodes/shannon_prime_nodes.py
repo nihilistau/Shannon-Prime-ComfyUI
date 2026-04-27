@@ -1146,6 +1146,23 @@ class ShannonPrimeWanBlockSkip:
                     "tooltip": "Only borrow when relative |c_i-c_j|/max exceeds this. 0.0=always borrow, 0.1=outliers only."}),
                 "twin_borrow_mode": (["symmetric", "low_anchor", "high_anchor"], {"default": "symmetric",
                     "tooltip": "v2 piece 3: borrow asymmetry. symmetric=both pull to mean. low_anchor=lower-prime fixed, higher pulls toward it. high_anchor=inverse."}),
+                # ── v2 quick win: Goldbach gap extension ─────────────────
+                # Twin primes (gap=2) are one slice of a larger structure.
+                # Cousin primes (gap=4) and sexy primes (gap=6) extend the
+                # arithmetical-neighbor connectivity graph. Larger gap =
+                # weaker neighbor, so α scales as 2/gap automatically.
+                "enable_goldbach_pairs": ("BOOLEAN", {"default": False,
+                    "tooltip": "v2 quick win: extend twin-prime borrow to Goldbach-style gap-4 (cousin) and gap-6 (sexy) prime pairs. α auto-scales (gap-2 = α, gap-4 = α/2, gap-6 = α/3). Only takes effect when enable_twin_borrow=True."}),
+                "goldbach_max_gap": ("INT", {"default": 6, "min": 2, "max": 12, "step": 2,
+                    "tooltip": "v5: highest even gap to include in the Goldbach extension. 6 = up to sexy primes (default). 8 = adds gap-8 cousin-twins. 12 = full extension to gap-12. α auto-scales as 2/gap; gap-12 borrows at α/6."}),
+                # ── v2 quick win: distance-to-Zeta-Zero decay scaling ─────
+                # Per-pair α is multiplied by exp(-λ · dist_to_nearest_zeta_zero)
+                # so that pairs straddling a Riemann-zero spectral position
+                # get full borrow strength while pairs between zeros get
+                # reduced strength. Realizes the paper's "Zero-Computation
+                # Resonance" claim. Only effective when twin_borrow is on.
+                "zeta_decay_lambda": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.30, "step": 0.01,
+                    "tooltip": "v2 quick win: Riemann-zero distance decay. 0=disabled (uniform α). 0.05=slow decay (mid-spectrum still borrows ~60%). 0.15=fast decay (only zero-adjacent pairs borrow). Compounds with twin_borrow_mode and goldbach_pairs."}),
                 # ── v2 piece 1/5: harmonic correction on cache hits ──────
                 # Sally as harmonic oscillator near equilibrium: when input
                 # drift is small the trajectory is approximately linear, so a
@@ -1157,6 +1174,14 @@ class ShannonPrimeWanBlockSkip:
                     "tooltip": "Linearly extrapolate y on cache hit using (y_curr - y_prev) velocity. Costs ~2× BlockSkip cache memory when on."}),
                 "harmonic_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.5, "step": 0.05,
                     "tooltip": "Strength of the linear correction. 0=no correction (identity), 0.5=conservative half-step, 1.0=full extrapolation."}),
+                # ── v2 quick win: tier-adaptive harmonic strength ─────────
+                # Granite has approximately flat Fisher metric — linear
+                # extrapolation is exact, full strength is safe. Jazz has
+                # curved metric — linear extrapolation degrades, scale down.
+                # When ON, per-tier multipliers: granite ×1.0, sand ×0.7,
+                # jazz ×0.4 applied on top of harmonic_strength.
+                "harmonic_tier_scaling": ("BOOLEAN", {"default": False,
+                    "tooltip": "Scale harmonic_strength per tier (granite ×1.0, sand ×0.7, jazz ×0.4). Reflects Fisher curvature — flatter manifold tolerates fuller extrapolation."}),
                 # ── v2 piece 2/7: layer-dependent skeleton fraction ──────
                 # Granite tier sits at cos_sim>0.999 across many steps —
                 # there's room for higher fidelity (more skeleton coefficients
@@ -1191,6 +1216,18 @@ class ShannonPrimeWanBlockSkip:
                     "tooltip": "When a drift- or curvature-induced miss fires, also invalidate ±cauchy_radius neighbor blocks within the same tier."}),
                 "cauchy_radius": ("INT", {"default": 2, "min": 0, "max": 10,
                     "tooltip": "Block-index radius for the reset. 0=no neighbors, 2=±2 same-tier neighbors, etc."}),
+                # ── v2 quick win: Hamiltonian sentinel ───────────────────
+                # Tracks the conserved-quantity proxy H = T + V where:
+                #   T = ‖x_curr - x_prev‖² / ‖x_prev‖²  (kinetic / input drift)
+                #   V = ‖y_curr - y_prev‖² / ‖y_prev‖²  (potential / output drift)
+                # Conservative dynamics keeps H roughly constant. Big jumps in
+                # H mean the trajectory has gained "energy" — it's leaving the
+                # basin (escape velocity). New gate fires alongside drift and
+                # curvature; tighter than either alone.
+                "enable_hamiltonian_gate": ("BOOLEAN", {"default": False,
+                    "tooltip": "v2 quick win: gate cache hits by conservation of H = kinetic_x + potential_y. Catches escapes that drift- and curvature-gates miss."}),
+                "hamiltonian_threshold": ("FLOAT", {"default": 0.30, "min": 0.05, "max": 1.0, "step": 0.05,
+                    "tooltip": "Max acceptable relative jump in H between miss steps (|ΔH|/H_prev). 0.30 = energy can grow 30% before forcing a refresh."}),
                 # ── v2 piece 7/7: foveated mask input ────────────────────
                 # Optional MASK that biases the gates toward stricter behavior
                 # when a subject of interest is identified. v1 uses scalar
@@ -1199,6 +1236,93 @@ class ShannonPrimeWanBlockSkip:
                 "subject_mask": ("MASK", ),
                 "subject_focus_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": "How much to tighten gates when subject_mask is provided. 0=ignore mask, 0.5=moderate, 1.0=aggressive."}),
+                # ── v3: per-token foveated mask application ──────────────
+                # The metaphor's "foveated heatmap" — subject pixels get
+                # full-fidelity reconstruction, background pixels get the
+                # arithmetical sketch. v3.0 lands the per-token policy on
+                # the harmonic-correction path: subject tokens get the full
+                # velocity extrapolation; background tokens get reduced
+                # extrapolation. Realizes one slice of the per-token
+                # foveation claim from the music_of_the_spheres paper.
+                #
+                # Spatial layout note: the mask is interpolated 1D to match
+                # the token count S. v3.0 doesn't know the (T, H_p, W_p)
+                # split so the interpolation is positional-density only;
+                # spatial-aware downsampling is the v3.1 follow-up.
+                "enable_per_token_harmonic": ("BOOLEAN", {"default": False,
+                    "tooltip": "v3 foveated: scale harmonic_strength per token by the subject_mask. Subject tokens get full extrapolation; background tokens get reduced. Only effective with enable_harmonic_correction=True AND subject_mask provided."}),
+                "background_harmonic_floor": ("FLOAT", {"default": 0.20, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Minimum α multiplier for background tokens (mask~0). 0=no extrapolation in background, 0.2=20% strength, 1.0=ignore mask."}),
+                # ── v4: higher-order geodesic integration (Verlet / AB2) ─
+                # Forward-Euler is order 1. Adams-Bashforth-2 uses two
+                # previous velocities for an order-2 extrapolation that's
+                # exact for quadratic trajectories — reflects Christoffel-
+                # corrected parallel transport when the manifold is curved.
+                # Storage: 3× cache memory (curr + prev + prev_prev y).
+                "harmonic_order": (["1_euler", "2_ab2", "3_ab3"], {"default": "1_euler",
+                    "tooltip": "v4/v5: harmonic correction integrator order. 1_euler = forward-Euler (1× extra cache). 2_ab2 = Adams-Bashforth 2-step (2× extra cache, exact for quadratic). 3_ab3 = AB3 with t-1, t-2, t-3 (3× extra cache, exact for cubic; falls back to AB2 then Euler when prior caches not yet populated)."}),
+                # ── v4: Gauss-flux per-head energy conservation gate ─────
+                # Track per-head L2 energy of attention output. If one head
+                # dominates (dispersion grows by N sigma), the block is
+                # generating "internal heat" — hallucination noise. Force
+                # a refresh. Different signal than cos_sim drift.
+                "enable_gauss_flux_gate": ("BOOLEAN", {"default": False,
+                    "tooltip": "v4: gate cache hits by per-head energy dispersion. Catches 'internal heat' (one head dominating) that cos_sim doesn't see."}),
+                "flux_threshold_sigmas": ("FLOAT", {"default": 3.0, "min": 1.0, "max": 8.0, "step": 0.5,
+                    "tooltip": "Number of standard deviations a single head's energy can exceed the mean before triggering. 3.0 = strict, 5.0 = lenient."}),
+                # ── v4: temporal Cauchy reset (scene-cut detector) ───────
+                # Beyond the within-tier block-index Cauchy reset, also
+                # detect a "scene cut" via input-drift sentinel: when the
+                # mean magnitude of x jumps by more than scene_cut_threshold
+                # between steps, invalidate ALL block caches. Reflects the
+                # paper's "expanding shell of news" — accelerated charge
+                # radiates a wavefront that re-anchors the temporal cache.
+                "enable_temporal_cauchy": ("BOOLEAN", {"default": False,
+                    "tooltip": "v4: detect scene cuts via input-drift jumps; on detection invalidate all block caches at once."}),
+                "scene_cut_threshold": ("FLOAT", {"default": 0.30, "min": 0.05, "max": 1.00, "step": 0.05,
+                    "tooltip": "Relative input-magnitude jump that counts as a scene cut. 0.30 = 30% increase between steps fires the reset."}),
+                # ── v4: decaying bit-memory (arithmetical friction) ──────
+                # The metaphor's "trampoline manifold" — recent bits have
+                # full bounce, older bits decay back into Granite. Layered
+                # on top of harmonic correction: scale by exp(-rate*age)
+                # so older cached values contribute less. Default rate=0
+                # disables (existing linear-window behavior).
+                "bit_decay_rate": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.30, "step": 0.01,
+                    "tooltip": "v4: exponential decay applied to harmonic-correction strength as a function of cache age. 0=disabled, 0.10 = e-fold every ~10 steps."}),
+                # ── v5: cross-tier energy borrowing ──────────────────────
+                # When a non-granite block flags a sentinel violation, blend
+                # its loaded skeleton with the running mean skeleton of the
+                # next-stabler tier (sand→granite, jazz→sand). Realizes the
+                # "bidirectional flow" from Gemini's notes — Granite donates
+                # arithmetical structure to Sand/Jazz under stress. Operates
+                # in spectral skeleton space, decode-only, only when
+                # cache_compress=vht2.
+                "enable_cross_tier_borrow": ("BOOLEAN", {"default": False,
+                    "tooltip": "v5: blend a sentinel-flagged block's skeleton with the next-stabler tier's running mean skeleton. Granite is the donor backbone. Decode-only."}),
+                "cross_tier_alpha": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 0.5, "step": 0.01,
+                    "tooltip": "Blend strength: 0=no borrow, 0.5=half-and-half. Default 0.10 conservative."}),
+                # ── v5: strict 1D-circle Granite reconstruction ──────────
+                # Store ONLY a scalar phase θ per Granite block + a single
+                # reference vector V₀ shared per generation. Reconstruct via
+                # y_recon = V₀ * (1 + θ * γ). Theoretical 100×+ Granite-tier
+                # compression ceiling — turns Granite cache into a kilobyte.
+                # Falls back to skeleton-mode if the 1D approximation's
+                # residual exceeds tolerance.
+                "enable_one_dim_granite": ("BOOLEAN", {"default": False,
+                    "tooltip": "v5: store granite blocks as scalar phase θ instead of skeleton coefficients. Theoretical 100×+ granite-tier compression. Falls back to skeleton mode when residual exceeds 1d_residual_tol."}),
+                "one_dim_residual_tol": ("FLOAT", {"default": 0.10, "min": 0.01, "max": 0.50, "step": 0.01,
+                    "tooltip": "Max relative residual ‖y - y_recon‖/‖y‖ before falling back to skeleton mode."}),
+                # ── v5: per-token skeleton fraction (foveated v3.1) ──────
+                # Subject tokens decompressed from richer skeleton, background
+                # from sparser. Realizes the per-token foveation claim from
+                # paper §8 in spectral space. Subject tokens use granite_skel_
+                # frac; background tokens use background_skel_frac. Spatial-
+                # aware downsampling of the mask uses 1D interp (same caveat
+                # as v3 per-token harmonic).
+                "enable_per_token_skeleton": ("BOOLEAN", {"default": False,
+                    "tooltip": "v5: per-token VHT2 skeleton fraction driven by subject_mask. Subject tokens at granite_skel_frac, background at background_skel_frac. Only when cache_compress=vht2."}),
+                "background_skel_frac": ("FLOAT", {"default": 0.10, "min": 0.05, "max": 1.0, "step": 0.05,
+                    "tooltip": "Skeleton fraction for background tokens when per_token_skeleton is on. 0.10 = 1-bit-sketch territory."}),
                 "verbose": ("BOOLEAN", {"default": False,
                     "tooltip": "Print per-block HIT/MISS logs + Fisher cos_sim + Partition Z proxy"}),
             },
@@ -1217,12 +1341,23 @@ class ShannonPrimeWanBlockSkip:
               enable_sigma_streak=False,
               enable_twin_borrow=False, twin_alpha=0.10, twin_threshold=0.0,
               twin_borrow_mode="symmetric",
+              enable_goldbach_pairs=False, zeta_decay_lambda=0.0, goldbach_max_gap=6,
               enable_harmonic_correction=False, harmonic_strength=0.5,
+              harmonic_tier_scaling=False,
               enable_tier_skeleton=False,
               granite_skel_frac=0.50, sand_skel_frac=0.30, jazz_skel_frac=0.20,
               enable_curvature_gate=False, curvature_threshold=-0.05,
               enable_cauchy_reset=False, cauchy_radius=2,
+              enable_hamiltonian_gate=False, hamiltonian_threshold=0.30,
               subject_mask=None, subject_focus_strength=0.5,
+              enable_per_token_harmonic=False, background_harmonic_floor=0.20,
+              harmonic_order="1_euler",
+              enable_gauss_flux_gate=False, flux_threshold_sigmas=3.0,
+              enable_temporal_cauchy=False, scene_cut_threshold=0.30,
+              bit_decay_rate=0.0,
+              enable_cross_tier_borrow=False, cross_tier_alpha=0.10,
+              enable_one_dim_granite=False, one_dim_residual_tol=0.10,
+              enable_per_token_skeleton=False, background_skel_frac=0.10,
               verbose=False, **_ignored):
         import types
         import comfy.model_management
@@ -1261,6 +1396,17 @@ class ShannonPrimeWanBlockSkip:
                             _obj.get("step_cached", {}).clear()
                             _obj.get("hit_streak", {}).clear()
                             _obj.get("prev_attn_cache", {}).clear()
+                            _obj.get("prev_prev_attn_cache", {}).clear()
+                            _obj.get("prev3_attn_cache", {}).clear()
+                            _obj.get("prev_x", {}).clear()
+                            _obj.get("hamiltonian", {}).clear()
+                            _obj.get("hamiltonian_violation", {}).clear()
+                            _obj.get("gauss_violation", {}).clear()
+                            _obj.get("granite_v0", {}).clear()
+                            _obj.get("granite_theta", {}).clear()
+                            _obj.get("granite_lambda", {}).clear()
+                            _obj.get("tier_skeleton_avg", {}).clear()
+                            _obj.get("tier_skeleton_count", {}).clear()
                             _cleared += 1
                     except ValueError:
                         pass
@@ -1356,6 +1502,23 @@ class ShannonPrimeWanBlockSkip:
             'prev_attn_cache':{},       # block_idx -> previous miss's y (for harmonic correction)
             'delta_sim':      {},       # v2 piece 4: last (rolling - prev_rolling) per block
             'curvature_violation': {},  # v2 piece 4: per-block flag set when accel < threshold
+            # ── v2 quick win: Hamiltonian sentinel state ──────────────
+            'prev_x_norm':    {},       # block_idx -> ‖x_prev‖ at last miss
+            'prev_x':         {},       # block_idx -> x tensor at last miss (CPU fp16)
+            'hamiltonian':    {},       # block_idx -> last computed H
+            'hamiltonian_violation': {},# block_idx -> bool flag for escape-velocity miss
+            # ── v4 quick wins state ──────────────────────────────────────
+            'prev_prev_attn_cache': {}, # v4: t-2 y for AB2 integrator
+            'prev3_attn_cache':     {}, # v5: t-3 y for AB3 integrator
+            'gauss_violation':      {}, # v4: per-block flag from flux gate
+            'temporal_x_norm':      [None],  # last step's mean ‖x‖ for scene cuts
+            'scene_cut_flag':       [False], # v4: set by sentinel, read on next step
+            # ── v5 strict 1D-circle Granite reconstruction state ─────
+            'granite_v0':       {},    # block_idx -> reference vector V₀ (CPU fp16)
+            'granite_theta':    {},    # block_idx -> last extracted phase θ (float)
+            # ── v5 cross-tier energy borrowing state ─────────────────
+            'tier_skeleton_avg': {},   # tier_name -> running mean of stored skeletons
+            'tier_skeleton_count': {}, # tier_name -> count
         }
 
         # ── v2 piece 7/7: foveated mask coverage ─────────────────────────
@@ -1376,6 +1539,39 @@ class ShannonPrimeWanBlockSkip:
 
         # Threshold boost = focus_strength * coverage * 0.05 (max +5pp tighter)
         _subject_boost = subject_focus_strength * _subject_coverage * 0.05
+
+        # v3: per-token mask cache for the foveated harmonic correction.
+        # Lazy: mask is flattened+stored at patch time, interpolated to the
+        # actual token count S on the first forward of each shape, cached.
+        _mask_flat_cpu = None
+        if (subject_mask is not None and enable_per_token_harmonic
+                and hasattr(subject_mask, 'float')):
+            try:
+                _mask_flat_cpu = subject_mask.float().flatten().detach().cpu()
+            except Exception:
+                _mask_flat_cpu = None
+        _per_token_cache: dict = {}
+
+        def _per_token_weight(S: int, device, dtype):
+            """Interpolate mask to S tokens, scaled to [floor, 1.0]. Cached."""
+            if _mask_flat_cpu is None or not enable_per_token_harmonic:
+                return None
+            key = (S, str(device), str(dtype))
+            w = _per_token_cache.get(key)
+            if w is None:
+                try:
+                    m1d = _mask_flat_cpu.view(1, 1, -1)
+                    w_cpu = torch.nn.functional.interpolate(
+                        m1d, size=S, mode='linear', align_corners=False
+                    ).view(-1).clamp(0.0, 1.0)
+                    # Linear scale into [floor, 1.0]
+                    floor = float(background_harmonic_floor)
+                    w_cpu = floor + (1.0 - floor) * w_cpu
+                    w = w_cpu.to(device=device, dtype=dtype)
+                    _per_token_cache[key] = w
+                except Exception:
+                    return None
+            return w
 
         # ── Tier-aware drift threshold (strange-attractor stack) ─────────
         # Returns the minimum rolling cos_sim required to allow a cache hit.
@@ -1413,8 +1609,11 @@ class ShannonPrimeWanBlockSkip:
                 if bi == triggering:
                     continue
                 for k in ('attn_cache', 'xattn_cache', 'ffn_cache',
-                          'prev_attn_cache', 'step_cached', 'hit_streak',
-                          'rolling_sim', 'delta_sim', 'curvature_violation'):
+                          'prev_attn_cache', 'prev_prev_attn_cache',
+                          'step_cached', 'hit_streak',
+                          'rolling_sim', 'delta_sim', 'curvature_violation',
+                          'prev_x', 'hamiltonian', 'hamiltonian_violation',
+                          'gauss_violation'):
                     if bi in st.get(k, {}):
                         st[k].pop(bi, None)
                         cleared += 1
@@ -1503,6 +1702,28 @@ class ShannonPrimeWanBlockSkip:
                     state['global_step'][0] += 1
                 step = state['global_step'][0]
 
+                # v4: temporal Cauchy / scene-cut detector. Block-0 only,
+                # at the start of each step. Compares mean ‖x‖ to prev
+                # step's; sets scene_cut_flag if relative jump exceeds
+                # threshold. The flag is read by all blocks this step,
+                # cleared at the start of next step on block-0.
+                if enable_temporal_cauchy and block_idx == 0:
+                    try:
+                        curr_x_norm = float(x.float().pow(2).mean().sqrt().item())
+                        prev_x_norm = state['temporal_x_norm'][0]
+                        # Always clear the previous-step flag at start of new step
+                        state['scene_cut_flag'][0] = False
+                        if prev_x_norm is not None and prev_x_norm > 1e-6:
+                            rel_jump = abs(curr_x_norm - prev_x_norm) / prev_x_norm
+                            if rel_jump > scene_cut_threshold:
+                                state['scene_cut_flag'][0] = True
+                                if verbose:
+                                    print(f"[SP BlockSkip] TEMPORAL CAUCHY (scene cut) "
+                                          f"step={step} jump={rel_jump:.2%} > {scene_cut_threshold:.2%}")
+                        state['temporal_x_norm'][0] = curr_x_norm
+                    except Exception:
+                        pass
+
                 # Generation boundary: handled by patch() clearing at prompt
                 # start. NO runtime detection — SVI distilled schedules have
                 # non-monotonic sigma, so e_mag increase != new generation.
@@ -1568,28 +1789,55 @@ class ShannonPrimeWanBlockSkip:
                 else:
                     curvature_ok = True
 
+                # v2 quick win: Hamiltonian sentinel — energy conservation.
+                if enable_hamiltonian_gate:
+                    hamiltonian_ok = not state['hamiltonian_violation'].get(block_idx, False)
+                else:
+                    hamiltonian_ok = True
+
+                # v4: Gauss-flux gate — per-head energy dispersion.
+                if enable_gauss_flux_gate:
+                    flux_ok = not state['gauss_violation'].get(block_idx, False)
+                else:
+                    flux_ok = True
+
+                # v4: temporal Cauchy (scene cut). Set on block-0 by sentinel,
+                # consumed by all blocks for one step. Self-clearing after use.
+                temporal_ok = True
+                if enable_temporal_cauchy and state['scene_cut_flag'][0]:
+                    temporal_ok = False
+
                 # ── CACHE HIT ──────────────────────────────────────────────
                 _streak_limit = _current_streak_limit()
+                # v5: 1D-circle path counts as a y-cache for granite blocks
+                has_y_cache = (cached_y is not None) or (
+                    enable_one_dim_granite and block_idx < 4
+                    and state['granite_v0'].get(block_idx) is not None
+                    and state['granite_lambda'].get(block_idx) is not None)
                 # Detect a "would have hit but for the gates" — that's the
                 # signal for a Cauchy reset to fire (real basin escape, not
                 # just window/streak expiry).
-                gate_forced_miss = (cached_y is not None
+                gate_forced_miss = (has_y_cache
                                     and cached_xa is not None
                                     and age >= 0 and age < window
                                     and streak < _streak_limit
-                                    and not (drift_ok and curvature_ok))
+                                    and not (drift_ok and curvature_ok and hamiltonian_ok
+                                             and flux_ok and temporal_ok))
                 if enable_cauchy_reset and gate_forced_miss and cauchy_radius > 0:
                     n_cleared = _cauchy_reset(block_idx, state)
                     if verbose and n_cleared > 0:
                         print(f"[SP BlockSkip] B{block_idx:02d} CAUCHY RESET — "
                               f"cleared {n_cleared} state entries on neighbors")
 
-                hit = (cached_y is not None
+                hit = (has_y_cache
                        and cached_xa is not None
                        and age >= 0 and age < window
                        and streak < _streak_limit
                        and drift_ok
-                       and curvature_ok)
+                       and curvature_ok
+                       and hamiltonian_ok
+                       and flux_ok
+                       and temporal_ok)
 
                 # ── Helpers: store/load with per-block dtype ──��───────────
                 _blk_dtype = _dtype_for(block_idx)
@@ -1629,13 +1877,77 @@ class ShannonPrimeWanBlockSkip:
                             full = torch.zeros(t.shape[0], _head_dim,
                                                dtype=torch.float32)
                             full[:, _block_skel_mask] = t.float()
+
+                            # v5: per-token skeleton fraction. Background
+                            # tokens get high-frequency coefficients zeroed
+                            # so they reconstruct from a sparser skeleton
+                            # than subject tokens. Realizes the spatial
+                            # foveation claim from paper §8 in spectral
+                            # space. Reuses v3's per-token weight cache.
+                            if (enable_per_token_skeleton
+                                    and _mask_flat_cpu is not None):
+                                try:
+                                    pt_w = _per_token_weight(t.shape[0],
+                                                              full.device, full.dtype)
+                                    if pt_w is not None:
+                                        # Binary keep mask: 1 if subject, 0 if background.
+                                        # Threshold at 0.5 above the v3 floor.
+                                        keep_mask = (pt_w > 0.5).to(full.dtype)
+                                        # Skeleton coefficient indices, sorted ascending
+                                        skel_idx = _block_skel_mask.nonzero(
+                                            as_tuple=False).squeeze(-1).to(full.device)
+                                        bg_keep = max(1, int(_block_skel_size * background_skel_frac))
+                                        if bg_keep < _block_skel_size:
+                                            bg_zero_idx = skel_idx[bg_keep:]
+                                            # Scale those coefficients per-token by keep_mask
+                                            high = full.index_select(-1, bg_zero_idx)
+                                            high = high * keep_mask.unsqueeze(-1)
+                                            full.index_copy_(-1, bg_zero_idx, high)
+                                            del high
+                                except Exception:
+                                    pass
+
+                            # v5: cross-tier energy borrow. If this block
+                            # has flagged a sentinel violation and the
+                            # next-stabler-tier has accumulated mean skeleton,
+                            # blend the loaded coefficients with the donor
+                            # mean. Operates in spectral skeleton space.
+                            if enable_cross_tier_borrow and block_idx >= 4 and cross_tier_alpha > 0.0:
+                                has_violation = (
+                                    state['gauss_violation'].get(block_idx, False) or
+                                    state['hamiltonian_violation'].get(block_idx, False) or
+                                    state['curvature_violation'].get(block_idx, False))
+                                if has_violation:
+                                    donor_tier = 'granite' if block_idx < 9 else 'sand'
+                                    donor_avg = state['tier_skeleton_avg'].get(donor_tier)
+                                    if donor_avg is not None and donor_avg.shape[-1] == _block_skel_size:
+                                        try:
+                                            donor_dev = donor_avg.to(device=full.device, dtype=full.dtype)
+                                            mixed = ((1.0 - cross_tier_alpha) * full[:, _block_skel_mask]
+                                                     + cross_tier_alpha * donor_dev.unsqueeze(0))
+                                            full[:, _block_skel_mask] = mixed
+                                            del donor_dev
+                                        except Exception:
+                                            pass
+
                             # Strange-attractor stack piece 3/4: twin-prime borrow
                             # before the inverse butterfly (decode-only).
                             if enable_twin_borrow:
-                                full = _vht2_bridge.apply_twin_borrow(
-                                    full, _block_skel_mask,
-                                    alpha=twin_alpha, threshold=twin_threshold,
-                                    mode=twin_borrow_mode)
+                                if enable_goldbach_pairs:
+                                    # v5: dynamic gap range up to user-selected max
+                                    _gaps = tuple(g for g in (2, 4, 6, 8, 10, 12) if g <= goldbach_max_gap)
+                                    full = _vht2_bridge.apply_goldbach_borrow(
+                                        full, _block_skel_mask,
+                                        alpha=twin_alpha, threshold=twin_threshold,
+                                        mode=twin_borrow_mode,
+                                        gaps=_gaps,
+                                        zeta_lambda=zeta_decay_lambda)
+                                else:
+                                    full = _vht2_bridge.apply_twin_borrow(
+                                        full, _block_skel_mask,
+                                        alpha=twin_alpha, threshold=twin_threshold,
+                                        mode=twin_borrow_mode,
+                                        zeta_lambda=zeta_decay_lambda)
                             recon = _vht2_bridge.forward(full)  # inverse
                             return recon.to(device=x.device, dtype=x.dtype)
                         except Exception:
@@ -1643,8 +1955,26 @@ class ShannonPrimeWanBlockSkip:
                     return _load(t)
 
                 if hit:
-                    # Self-attn: cached pre-gate y + current step's gate
-                    y = _load_maybe_vht2(cached_y)
+                    # v5: strict 1D-circle Granite reconstruction.
+                    # If this block is in 1D mode, reconstruct y from
+                    # V₀ × λ instead of loading skeleton. Falls through
+                    # to normal load when inactive or shape-mismatched.
+                    y = None
+                    if (enable_one_dim_granite and block_idx < 4):
+                        v0 = state['granite_v0'].get(block_idx)
+                        lam = state['granite_lambda'].get(block_idx)
+                        if v0 is not None and lam is not None:
+                            try:
+                                if v0.shape[:-1] == x.shape[:-1]:
+                                    v0_dev = v0.to(device=x.device, dtype=x.dtype)
+                                    lam_dev = lam.to(device=x.device, dtype=x.dtype)
+                                    y = v0_dev * lam_dev   # [B,S,hidden] * [B,S,1]
+                                    del v0_dev, lam_dev
+                            except Exception:
+                                y = None
+                    if y is None:
+                        # Self-attn: cached pre-gate y + current step's gate
+                        y = _load_maybe_vht2(cached_y)
 
                     # v2 piece 1/5: harmonic correction.
                     # Linear forward-Euler extrapolation along the (curr - prev)
@@ -1655,9 +1985,56 @@ class ShannonPrimeWanBlockSkip:
                         if prev_y_storage is not None and window > 0:
                             try:
                                 y_prev = _load_maybe_vht2(prev_y_storage)
-                                scale = (age / float(window)) * harmonic_strength
+                                # v2 quick win: tier-adaptive strength.
+                                tier_mult = 1.0
+                                if harmonic_tier_scaling:
+                                    if block_idx < 4:    tier_mult = 1.0   # granite
+                                    elif block_idx < 9:  tier_mult = 0.7   # sand
+                                    else:                tier_mult = 0.4   # jazz
+
+                                # v4: optional bit-decay (exp falloff with age)
+                                base_t = age / float(window)
+                                if bit_decay_rate > 0.0:
+                                    base_t = base_t * math.exp(-bit_decay_rate * age)
+                                scale = base_t * harmonic_strength * tier_mult
+
+                                # v4/v5: higher-order integrators.
+                                # AB2 needs t-2; AB3 needs t-2 AND t-3.
+                                # Falls back gracefully when prior caches absent.
+                                velocity = y - y_prev
+                                if harmonic_order in ("2_ab2", "3_ab3"):
+                                    pp_storage = state['prev_prev_attn_cache'].get(block_idx)
+                                    if pp_storage is not None:
+                                        try:
+                                            y_pp = _load_maybe_vht2(pp_storage)
+                                            v_curr = y - y_prev
+                                            v_prev = y_prev - y_pp
+                                            if harmonic_order == "3_ab3":
+                                                p3_storage = state['prev3_attn_cache'].get(block_idx)
+                                                if p3_storage is not None:
+                                                    try:
+                                                        y_p3 = _load_maybe_vht2(p3_storage)
+                                                        v_pp = y_pp - y_p3
+                                                        # AB3: y_{n+1} = y_n + h(23/12 v_n - 16/12 v_{n-1} + 5/12 v_{n-2})
+                                                        velocity = (23.0/12.0) * v_curr - (16.0/12.0) * v_prev + (5.0/12.0) * v_pp
+                                                        del y_p3
+                                                    except Exception:
+                                                        velocity = 1.5 * v_curr - 0.5 * v_prev
+                                                else:
+                                                    velocity = 1.5 * v_curr - 0.5 * v_prev
+                                            else:
+                                                velocity = 1.5 * v_curr - 0.5 * v_prev
+                                            del y_pp
+                                        except Exception:
+                                            pass
+
                                 if scale > 0.0:
-                                    y = y + scale * (y - y_prev)
+                                    # v3: per-token foveated scaling.
+                                    pt_w = _per_token_weight(y.shape[1], y.device, y.dtype)
+                                    if pt_w is not None:
+                                        y = y + scale * pt_w.view(1, -1, 1) * velocity
+                                    else:
+                                        y = y + scale * velocity
                                 del y_prev
                             except Exception:
                                 pass  # fail safe — use unmodified y
@@ -1710,7 +2087,9 @@ class ShannonPrimeWanBlockSkip:
                     # ~2-step memory: enough to filter single-step blips but
                     # responsive enough to catch a real attractor escape.
                     prev_y = state['attn_cache'].get(block_idx)
-                    if prev_y is not None and (verbose or enable_drift_gate or enable_curvature_gate):
+                    if prev_y is not None and (verbose or enable_drift_gate
+                                                or enable_curvature_gate
+                                                or enable_hamiltonian_gate):
                         prev_on_dev = _load(prev_y)
                         f_sim = _fisher_cos_sim(y, prev_on_dev, _fisher_w)
                         state['fisher_sim'][block_idx] = f_sim
@@ -1725,21 +2104,145 @@ class ShannonPrimeWanBlockSkip:
                                 prev_delta = state['delta_sim'].get(block_idx, 0.0)
                                 accel = curr_delta - prev_delta
                                 state['delta_sim'][block_idx] = curr_delta
-                                # Negative accel below threshold = sim accelerating
-                                # downward = trajectory escaping basin. Set flag
-                                # so next hit decision denies the hit.
                                 state['curvature_violation'][block_idx] = (
                                     accel < curvature_threshold)
+
+                        # v4: Gauss-flux per-head energy gate.
+                        # Reshape y from [B, S, num_heads*head_dim] to
+                        # [B, S, num_heads, head_dim], compute per-head L2
+                        # energy summed over (B, S, head_dim). If dispersion
+                        # in head energies (z-score of max) exceeds threshold,
+                        # flag the block as generating "internal heat".
+                        if enable_gauss_flux_gate:
+                            try:
+                                hd = _head_dim
+                                if y.shape[-1] % hd == 0 and y.shape[-1] >= hd * 2:
+                                    nh = y.shape[-1] // hd
+                                    yh = y.float().reshape(*y.shape[:-1], nh, hd)
+                                    # per-head energy (single scalar per head)
+                                    energies = yh.pow(2).mean(dim=tuple(range(yh.ndim - 2)) + (-1,))
+                                    # energies shape: [num_heads]
+                                    e_mean = energies.mean()
+                                    e_std = energies.std().clamp(min=1e-12)
+                                    z_max = float(((energies.max() - e_mean) / e_std).item())
+                                    state['gauss_violation'][block_idx] = (
+                                        z_max > flux_threshold_sigmas)
+                            except Exception:
+                                pass
+
+                        # v2 quick win: Hamiltonian sentinel.
+                        # T = relative drift of input x; V = relative drift
+                        # of output y. H = T + V. Conservative dynamics →
+                        # H roughly constant. Big jumps signal escape.
+                        if enable_hamiltonian_gate:
+                            try:
+                                # Output drift V (already on-device)
+                                y_prev_dev = prev_on_dev
+                                v_term = float((y - y_prev_dev).pow(2).mean().item() /
+                                               max(y_prev_dev.pow(2).mean().item(), 1e-12))
+                                # Input drift T (compare against stored prev_x)
+                                stored_x = state['prev_x'].get(block_idx)
+                                if stored_x is not None:
+                                    x_prev_dev = stored_x.to(device=x.device, dtype=x.dtype)
+                                    t_term = float((x - x_prev_dev).pow(2).mean().item() /
+                                                   max(x_prev_dev.pow(2).mean().item(), 1e-12))
+                                    del x_prev_dev
+                                else:
+                                    t_term = 0.0
+                                H_curr = t_term + v_term
+                                H_prev = state['hamiltonian'].get(block_idx, H_curr)
+                                # Relative jump in H. First step has H_prev==H_curr → 0.
+                                rel_jump = (abs(H_curr - H_prev) /
+                                            max(abs(H_prev), 1e-6))
+                                state['hamiltonian'][block_idx] = H_curr
+                                state['hamiltonian_violation'][block_idx] = (
+                                    rel_jump > hamiltonian_threshold)
+                                # Store current x (CPU fp16) for next miss step
+                                state['prev_x'][block_idx] = (
+                                    x.detach().to(dtype=torch.float16).cpu())
+                            except Exception:
+                                pass  # fail safe — gate stays clear
                         del prev_on_dev
 
-                    # v2 piece 1/5: capture prev y before overwriting,
-                    # for harmonic correction on subsequent hits.
+                    # v2 piece 1/5: capture prev y before overwriting.
+                    # v4/v5: rotate the chain so AB2 has t-1/t-2 and
+                    # AB3 has t-1/t-2/t-3.
                     if enable_harmonic_correction:
+                        if harmonic_order == "3_ab3":
+                            p3_prev = state['prev_prev_attn_cache'].get(block_idx)
+                            if p3_prev is not None:
+                                state['prev3_attn_cache'][block_idx] = p3_prev
+                        if harmonic_order in ("2_ab2", "3_ab3"):
+                            pp_prev = state['prev_attn_cache'].get(block_idx)
+                            if pp_prev is not None:
+                                state['prev_prev_attn_cache'][block_idx] = pp_prev
                         prev_storage = state['attn_cache'].get(block_idx)
                         if prev_storage is not None:
                             state['prev_attn_cache'][block_idx] = prev_storage
 
-                    state['attn_cache'][block_idx] = _store(y)
+                    # v5: strict 1D-circle Granite reconstruction.
+                    # For granite blocks under enable_one_dim_granite,
+                    # extract scalar λ such that y ≈ V₀ × λ per token.
+                    # If the residual fits within tolerance, store ONLY
+                    # the lambda (and V₀ once); skip the skeleton store.
+                    one_dim_stored = False
+                    if (enable_one_dim_granite and block_idx < 4):
+                        try:
+                            v0 = state['granite_v0'].get(block_idx)
+                            if v0 is None or v0.shape[:-1] != y.shape[:-1]:
+                                # First miss for this shape: capture V₀.
+                                state['granite_v0'][block_idx] = (
+                                    y.detach().to(dtype=torch.float16).cpu())
+                                ones = torch.ones(*y.shape[:-1], 1,
+                                                  dtype=torch.float16)
+                                state['granite_lambda'][block_idx] = ones
+                                one_dim_stored = True
+                            else:
+                                v0_dev = v0.to(device=y.device, dtype=y.dtype)
+                                # Per-token projection λ[s] = ⟨y[s], V₀[s]⟩ / ‖V₀[s]‖²
+                                num = (y * v0_dev).sum(dim=-1, keepdim=True)
+                                den = v0_dev.pow(2).sum(dim=-1, keepdim=True).clamp(min=1e-6)
+                                lam = num / den
+                                # Residual fit check
+                                y_recon = lam * v0_dev
+                                ynorm = max(y.float().pow(2).sum().sqrt().item(), 1e-6)
+                                res = (y - y_recon).float().pow(2).sum().sqrt().item() / ynorm
+                                if res <= one_dim_residual_tol:
+                                    state['granite_lambda'][block_idx] = (
+                                        lam.detach().to(dtype=torch.float16).cpu())
+                                    one_dim_stored = True
+                                del v0_dev, num, den, lam, y_recon
+                        except Exception:
+                            pass
+
+                    if not one_dim_stored:
+                        state['attn_cache'][block_idx] = _store(y)
+                    else:
+                        # In 1D mode for this block — clear any stale skeleton
+                        state['attn_cache'][block_idx] = None
+
+                    # v5: update tier-averaged skeleton mean for cross-tier borrow.
+                    # Donor pool is built from MISS-step stored skeletons.
+                    if enable_cross_tier_borrow and _use_vht2:
+                        try:
+                            stored = state['attn_cache'].get(block_idx)
+                            if (stored is not None
+                                    and stored.shape[-1] == _block_skel_size):
+                                tier = ('granite' if block_idx < 4 else
+                                        'sand' if block_idx < 9 else 'jazz')
+                                # Mean over leading dims → [skeleton_size]
+                                mean_skel = stored.float().mean(
+                                    dim=tuple(range(stored.ndim - 1)))
+                                count = state['tier_skeleton_count'].get(tier, 0)
+                                old_avg = state['tier_skeleton_avg'].get(tier)
+                                if old_avg is None:
+                                    state['tier_skeleton_avg'][tier] = mean_skel
+                                else:
+                                    state['tier_skeleton_avg'][tier] = (
+                                        count * old_avg + mean_skel) / (count + 1)
+                                state['tier_skeleton_count'][tier] = count + 1
+                        except Exception:
+                            pass
 
                     x = torch.addcmul(x, y, repeat_e(e_mods[2], x))
                     del y
@@ -1836,14 +2339,16 @@ class ShannonPrimeWanBlockSkip:
                   f"across sigma range (sigma source: {src})")
         if enable_twin_borrow:
             if _use_vht2:
+                gold_str = " + Goldbach (gap 2/4/6)" if enable_goldbach_pairs else ""
                 print(f"[SP BlockSkip] Twin-prime borrow ON: α={twin_alpha:.2f} "
-                      f"threshold={twin_threshold:.2f} mode={twin_borrow_mode} "
-                      f"(decode-only, 9 disjoint pairs)")
+                      f"threshold={twin_threshold:.2f} mode={twin_borrow_mode}"
+                      f"{gold_str} (decode-only)")
             else:
                 print(f"[SP BlockSkip] Twin-prime borrow requested but cache_compress=raw — no-op")
         if enable_harmonic_correction:
-            print(f"[SP BlockSkip] Harmonic correction ON: strength={harmonic_strength:.2f} "
-                  f"(linear extrapolation, ~2× cache memory)")
+            tier_str = " (tier-scaled: G×1.0/S×0.7/J×0.4)" if harmonic_tier_scaling else ""
+            print(f"[SP BlockSkip] Harmonic correction ON: strength={harmonic_strength:.2f}"
+                  f"{tier_str} (linear extrapolation, ~2× cache memory)")
         if enable_tier_skeleton and _use_vht2:
             print(f"[SP BlockSkip] Tier-aware skeleton ON: "
                   f"granite={granite_skel_frac:.0%}, sand={sand_skel_frac:.0%}, "
@@ -1854,10 +2359,37 @@ class ShannonPrimeWanBlockSkip:
         if enable_cauchy_reset:
             print(f"[SP BlockSkip] Cauchy reset ON: radius={cauchy_radius} "
                   f"(invalidate ±{cauchy_radius} same-tier neighbors on gated miss)")
+        if enable_hamiltonian_gate:
+            print(f"[SP BlockSkip] Hamiltonian gate ON: threshold={hamiltonian_threshold:.2f} "
+                  f"(force miss when |ΔH|/H > threshold; H = T_x + V_y)")
+        if zeta_decay_lambda > 0.0 and enable_twin_borrow:
+            print(f"[SP BlockSkip] Zeta-decay borrow scaling ON: λ={zeta_decay_lambda:.3f}")
         if subject_mask is not None and _subject_coverage > 0.0:
             print(f"[SP BlockSkip] Subject mask: coverage={_subject_coverage:.1%} "
                   f"strength={subject_focus_strength:.2f} → "
                   f"+{_subject_boost*100:.1f}pp threshold boost on all tiers")
+        if enable_per_token_harmonic and _mask_flat_cpu is not None:
+            print(f"[SP BlockSkip] v3 per-token harmonic ON: floor={background_harmonic_floor:.2f} "
+                  f"(subject tokens: full α; background tokens: α × {background_harmonic_floor:.2f})")
+        if harmonic_order == "2_ab2" and enable_harmonic_correction:
+            print(f"[SP BlockSkip] v4 harmonic order: AB2 (Adams-Bashforth 2-step, 3× cache memory)")
+        if enable_gauss_flux_gate:
+            print(f"[SP BlockSkip] v4 Gauss-flux gate ON: σ-threshold={flux_threshold_sigmas:.1f} "
+                  f"(per-head energy dispersion)")
+        if enable_temporal_cauchy:
+            print(f"[SP BlockSkip] v4 temporal Cauchy ON: scene-cut threshold={scene_cut_threshold:.2%}")
+        if bit_decay_rate > 0.0:
+            print(f"[SP BlockSkip] v4 bit-decay ON: rate={bit_decay_rate:.3f} "
+                  f"(exp falloff on harmonic strength with cache age)")
+        if enable_cross_tier_borrow:
+            print(f"[SP BlockSkip] v5 cross-tier borrow ON: α={cross_tier_alpha:.2f} "
+                  f"(granite donates to sand/jazz on sentinel violation)")
+        if enable_one_dim_granite:
+            print(f"[SP BlockSkip] v5 1D-circle Granite ON: residual tol={one_dim_residual_tol:.2f} "
+                  f"(theoretical 100×+ granite-tier compression)")
+        if enable_per_token_skeleton:
+            print(f"[SP BlockSkip] v5 per-token skeleton ON: bg_frac={background_skel_frac:.2f} "
+                  f"(subject tokens full skeleton, background tokens high-freq zeroed)")
         if verbose:
             print(f"[SP BlockSkip] Verbose: Fisher cos_sim + Partition Z proxy logging enabled")
 
@@ -1935,6 +2467,17 @@ class ShannonPrimeWanCacheFlush:
                         obj.get("step_cached", {}).clear()
                         obj.get("hit_streak", {}).clear()
                         obj.get("prev_attn_cache", {}).clear()
+                        obj.get("prev_prev_attn_cache", {}).clear()
+                        obj.get("prev3_attn_cache", {}).clear()
+                        obj.get("prev_x", {}).clear()
+                        obj.get("hamiltonian", {}).clear()
+                        obj.get("hamiltonian_violation", {}).clear()
+                        obj.get("gauss_violation", {}).clear()
+                        obj.get("granite_v0", {}).clear()
+                        obj.get("granite_theta", {}).clear()
+                        obj.get("granite_lambda", {}).clear()
+                        obj.get("tier_skeleton_avg", {}).clear()
+                        obj.get("tier_skeleton_count", {}).clear()
                         if n > 0:
                             flushed_blockskip += 1
 
@@ -2385,24 +2928,203 @@ class ShannonPrimeWanRicciSentinel:
         return (patched,)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# v6 — Lyapunov Snapshot diagnostic
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ShannonPrimeWanLyapunovSnapshot:
+    """
+    v6 diagnostic: capture per-block per-step cache fingerprints for
+    Lyapunov spectrum analysis. Run twice with two slightly different
+    prompts/seeds, save to two snapshot files, then run sp_lyapunov_analyze.py
+    on the pair to extract per-block divergence rates.
+
+    Output: a numpy .npz file with arrays:
+      blocks  : int array of block indices recorded
+      steps   : int array of denoising steps
+      fp      : float32 array shape [n_blocks, n_steps, fingerprint_dim]
+
+    Fingerprint: per-block-per-step, take y after self_attn, average over
+    the token axis, slice the first `fingerprint_dim` hidden-dim entries.
+    Cheap, dimension-stable, sufficient for cosine-divergence Lyapunov
+    fitting. Storage: at fp_dim=128 with 30 blocks × 30 steps that's
+    30 × 30 × 128 × 4 = 460 KB per run. Trivial.
+
+    Place this node anywhere in the graph between UnetLoader and KSampler;
+    it patches the same per-block forward as BlockSkip but only reads
+    (doesn't modify) the y output.
+    """
+
+    CATEGORY    = "shannon-prime"
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION    = "patch"
+    DESCRIPTION = (
+        "v6 diagnostic — record per-block per-step cache fingerprints "
+        "to a .npz file for offline Lyapunov spectrum analysis. Run twice "
+        "with slightly different prompts, then run scripts/sp_lyapunov_analyze.py "
+        "on the snapshot pair to validate the dynamical-systems framing "
+        "and auto-tune drift-gate thresholds."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "snapshot_path": ("STRING", {"default": "snapshots/run_a.npz",
+                    "tooltip": "Output path for the snapshot .npz file. Created/overwritten on each run."}),
+            },
+            "optional": {
+                "fingerprint_dim": ("INT", {"default": 128, "min": 32, "max": 1024,
+                    "tooltip": "Per-block-step fingerprint dimensionality. 128 is plenty for cosine-divergence fitting."}),
+                "max_steps": ("INT", {"default": 64, "min": 4, "max": 200,
+                    "tooltip": "Max denoising steps to record. Beyond this, the snapshot is finalized and the patch becomes a no-op for safety."}),
+                "verbose": ("BOOLEAN", {"default": False,
+                    "tooltip": "Print [SP Snapshot] log on every block-step recorded"}),
+            },
+        }
+
+    @classmethod
+    def IS_CHANGED(cls, *a, **k):
+        return float("nan")
+
+    def patch(self, model, snapshot_path, fingerprint_dim=128, max_steps=64,
+              verbose=False, **_ignored):
+        import os
+        import pathlib
+        import numpy as _np
+
+        patched = model.clone()
+        blocks  = list(_iter_wan_blocks(patched))
+        if not blocks:
+            print("[SP Snapshot] no Wan blocks found — passing through")
+            return (patched,)
+
+        # Make sure the output dir exists
+        try:
+            out_path = pathlib.Path(snapshot_path)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            print(f"[SP Snapshot] could not prepare output dir: {e}")
+
+        # ── Snapshot state ────────────────────────────────────────────────
+        snap = {
+            'fingerprints': {},     # block_idx -> {step: np.ndarray[fp_dim]}
+            'global_step':  [0],
+            'output_path':  snapshot_path,
+            'fp_dim':       int(fingerprint_dim),
+            'max_steps':    int(max_steps),
+            'final_written': [False],
+        }
+
+        n_blocks = len(blocks)
+
+        def _make_snapshot_forward(orig_forward, block_idx):
+            def snap_forward(x, e, freqs, context,
+                             context_img_len=257,
+                             transformer_options={}):
+                # Step counter on block-0
+                if block_idx == 0:
+                    snap['global_step'][0] += 1
+                step = snap['global_step'][0]
+
+                # Run the original forward unchanged. We capture the y
+                # produced by its self-attention via a small intercept.
+                # Easiest path: call the original and then capture x_after
+                # = (post-block x) — pre-block x. That delta encodes the
+                # block's contribution. For Lyapunov purposes the delta is
+                # what diverges between the two runs.
+                if step <= snap['max_steps']:
+                    try:
+                        x_pre = x.detach().float().mean(dim=1).flatten()  # [B*hidden]
+                    except Exception:
+                        x_pre = None
+                else:
+                    x_pre = None
+
+                out = orig_forward(x, e, freqs, context,
+                                   context_img_len=context_img_len,
+                                   transformer_options=transformer_options)
+
+                if x_pre is not None:
+                    try:
+                        x_post = out.detach().float().mean(dim=1).flatten()
+                        delta = (x_post - x_pre)[:snap['fp_dim']].cpu().numpy()
+                        snap['fingerprints'].setdefault(block_idx, {})[step] = delta
+                        if verbose and block_idx == 0:
+                            print(f"[SP Snapshot] step={step} recorded "
+                                  f"(blocks so far this step: 1)")
+                        # On the LAST block of the LAST step, write to disk
+                        if (block_idx == n_blocks - 1 and step >= snap['max_steps']
+                                and not snap['final_written'][0]):
+                            _save_snapshot(snap)
+                            snap['final_written'][0] = True
+                    except Exception:
+                        pass
+
+                return out
+            return snap_forward
+
+        def _save_snapshot(s):
+            try:
+                fps = s['fingerprints']
+                if not fps:
+                    return
+                blocks_recorded = sorted(fps.keys())
+                # Determine maximum step seen
+                max_step = max(max(steps_dict.keys())
+                               for steps_dict in fps.values())
+                fp_dim = s['fp_dim']
+                arr = _np.zeros((len(blocks_recorded), max_step, fp_dim),
+                                dtype=_np.float32)
+                for bi, b in enumerate(blocks_recorded):
+                    for step, vec in fps[b].items():
+                        if 1 <= step <= max_step and vec.shape[0] == fp_dim:
+                            arr[bi, step - 1] = vec
+                _np.savez_compressed(
+                    s['output_path'],
+                    blocks=_np.array(blocks_recorded, dtype=_np.int32),
+                    steps=_np.arange(1, max_step + 1, dtype=_np.int32),
+                    fp=arr,
+                )
+                print(f"[SP Snapshot] wrote {s['output_path']} "
+                      f"({len(blocks_recorded)} blocks × {max_step} steps × {fp_dim} dim)")
+            except Exception as ex:
+                print(f"[SP Snapshot] save failed: {ex}")
+
+        # Patch every block (light wrapper — only reads, doesn't modify y)
+        for i, blk in blocks:
+            orig = blk.forward
+            blk.forward = _make_snapshot_forward(orig, i)
+
+        # Also expose a save function via the model for explicit dump
+        patched._sp_lyapunov_snapshot_state = snap
+
+        print(f"[SP Snapshot] patched {n_blocks} blocks, recording → {snapshot_path}")
+        print(f"[SP Snapshot] fingerprint_dim={fingerprint_dim}, max_steps={max_steps}")
+        return (patched,)
+
+
 NODE_CLASS_MAPPINGS = {
-    "ShannonPrimeWanCache":           ShannonPrimeWanCache,
-    "ShannonPrimeWanCacheStats":      ShannonPrimeWanCacheStats,
-    "ShannonPrimeWanCacheSqfree":     ShannonPrimeWanCacheSqfree,
-    "ShannonPrimeWanSelfExtract":     ShannonPrimeWanSelfExtract,
-    "ShannonPrimeWanBlockSkip":       ShannonPrimeWanBlockSkip,
-    "ShannonPrimeWanCacheFlush":      ShannonPrimeWanCacheFlush,
-    "ShannonPrimeWanSigmaSwitch":     ShannonPrimeWanSigmaSwitch,
-    "ShannonPrimeWanRicciSentinel":   ShannonPrimeWanRicciSentinel,
+    "ShannonPrimeWanCache":             ShannonPrimeWanCache,
+    "ShannonPrimeWanCacheStats":        ShannonPrimeWanCacheStats,
+    "ShannonPrimeWanCacheSqfree":       ShannonPrimeWanCacheSqfree,
+    "ShannonPrimeWanSelfExtract":       ShannonPrimeWanSelfExtract,
+    "ShannonPrimeWanBlockSkip":         ShannonPrimeWanBlockSkip,
+    "ShannonPrimeWanCacheFlush":        ShannonPrimeWanCacheFlush,
+    "ShannonPrimeWanSigmaSwitch":       ShannonPrimeWanSigmaSwitch,
+    "ShannonPrimeWanRicciSentinel":     ShannonPrimeWanRicciSentinel,
+    "ShannonPrimeWanLyapunovSnapshot":  ShannonPrimeWanLyapunovSnapshot,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ShannonPrimeWanCache":           "Shannon-Prime: Wan Cross-Attn Cache",
-    "ShannonPrimeWanCacheStats":      "Shannon-Prime: Cache Stats",
-    "ShannonPrimeWanCacheSqfree":     "Shannon-Prime: Wan Cross-Attn Cache (Sqfree)",
-    "ShannonPrimeWanSelfExtract":     "Shannon-Prime: Wan Self-Attn Extract (Phase 12)",
-    "ShannonPrimeWanBlockSkip":       "Shannon-Prime: Wan Block-Level Self-Attn Skip (VHT2)",
-    "ShannonPrimeWanCacheFlush":      "Shannon-Prime: Wan Block Cache Flush (before VAE)",
-    "ShannonPrimeWanSigmaSwitch":     "Shannon-Prime: Wan Sigma Switch (Phase 13)",
-    "ShannonPrimeWanRicciSentinel":   "Shannon-Prime: Wan Ricci Sentinel (Phase 13 diag)",
+    "ShannonPrimeWanCache":             "Shannon-Prime: Wan Cross-Attn Cache",
+    "ShannonPrimeWanCacheStats":        "Shannon-Prime: Cache Stats",
+    "ShannonPrimeWanCacheSqfree":       "Shannon-Prime: Wan Cross-Attn Cache (Sqfree)",
+    "ShannonPrimeWanSelfExtract":       "Shannon-Prime: Wan Self-Attn Extract (Phase 12)",
+    "ShannonPrimeWanBlockSkip":         "Shannon-Prime: Wan Block-Level Self-Attn Skip (VHT2)",
+    "ShannonPrimeWanCacheFlush":        "Shannon-Prime: Wan Block Cache Flush (before VAE)",
+    "ShannonPrimeWanSigmaSwitch":       "Shannon-Prime: Wan Sigma Switch (Phase 13)",
+    "ShannonPrimeWanRicciSentinel":     "Shannon-Prime: Wan Ricci Sentinel (Phase 13 diag)",
+    "ShannonPrimeWanLyapunovSnapshot":  "Shannon-Prime: Wan Lyapunov Snapshot (v6 diag)",
 }

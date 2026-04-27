@@ -1,14 +1,154 @@
 # Future Work — v5 and Beyond
 
-The strange-attractor-stack v1 → v4 covers most of the *Music of the Spheres*
-paper's tractable predictions. This document records the larger pieces that
-the framework predicts but the implementation has deliberately deferred,
-along with what implementing them would require. Listed roughly in order of
-practical leverage.
+This document records the pieces of the *Music of the Spheres* framework
+that haven't shipped yet, and the ambitions that go beyond the current
+paper. The working principle: file ideas here so they don't get lost,
+then build them when the prerequisites are in place.
 
 ---
 
-## V5 priority queue
+## Status as of v6
+
+Most of what was originally listed in v5 priority queue has shipped:
+
+- ✅ **Strict 1D-circle Granite reconstruction** — landed v5 (`enable_one_dim_granite`)
+- ✅ **Cross-tier energy borrowing** — landed v5 (`enable_cross_tier_borrow`)
+- ✅ **Per-token VHT2 skeleton fraction** — landed v5 (`enable_per_token_skeleton`)
+- ✅ **Higher-order integrators** — AB2 in v4, AB3 in v5 (`harmonic_order=3_ab3`); RK4 still future
+- ✅ **Goldbach gap-8/10/12** — landed v5 (`goldbach_max_gap`)
+- ✅ **Direct Lyapunov-spectrum measurement** — landed v6 (`ShannonPrimeWanLyapunovSnapshot` + `scripts/sp_lyapunov_analyze.py`)
+
+What's still genuinely future:
+
+- ❌ **Decode-path 1.58-bit ternary spatial sketch** (depends on per-token skel
+  validation)
+- ❌ **RK4 / symplectic integrators** beyond AB3
+- ❌ **Goldbach extension to gap-14+** (trivial — `_goldbach_pairs(n, gaps=...)`,
+  but needs a reason)
+- ❌ **Cross-architecture generalization** to SSMs, RNNs (research)
+- ❌ **Closed-form regime boundary prediction** from architecture (research)
+- ❌ **Hardware-accelerated VHT2+Möbius+banded fused kernel** for sub-1B real-time
+  models (engineering, ~2 weeks)
+
+---
+
+## The big new ambition — Multimodal Phase-Sync
+
+Filed for the record because the metaphor demands it but the engineering
+needs to be honest about what's hard.
+
+The proposal: link Voxtral TTS and Shannon-Prime Wan video at the arithmetical
+level via a shared phase anchor. Voice spectral flux drives video phase
+velocity; voice plosives trigger video Cauchy resets; voice fundamental
+frequency F₀ stabilizes the video Granite pillars. The two pipelines stop
+being "separately running and then synced" and become one manifold expressing
+itself through two shadows — pixel and phoneme.
+
+### The mechanism the metaphor predicts
+
+```
+θ_video(t) = θ_base + ∫₀ᵗ Ψ(Audio(τ)) dτ
+```
+
+where Ψ is a coupling function that maps audio spectral flux into per-step
+phase velocity for the video. High audio flux (sibilance) accelerates Sally
+through the Jazz layers; deep stable vowels phase-lock the video to its
+Radix-7 pillars. The Hamiltonian sentinel reinterprets audio energy as
+arithmetical kinetic energy. The Cauchy reset fires on plosives.
+
+A proposed C-side connector:
+
+```cpp
+typedef struct {
+    float spectral_flux;     // d|FFT|/dt of the audio buffer
+    float fundamental_f0;    // pitch anchor
+    float phase_velocity;    // resultant θ-shift
+    bool  trigger_reset;     // plosive/stop signal
+} VoxtralPhaseState;
+```
+
+passed via pointer from the Voxtral C++ engine to a `vht2_wan_kernel`
+extension that ingests the state on every CUDA call.
+
+### What's tractable about this
+
+- **Aligned generation timestamps.** TTS generates tokens at known sample
+  rates; video diffusion has known step counts. A coarse "audio frame N
+  drives video step M" mapping is mechanical and measurable.
+
+- **Plosive-triggered resets.** Detecting plosives in the audio buffer is
+  signal processing 101 (high-pass + envelope follower). Wiring that
+  trigger to the existing temporal Cauchy reset on the video side is a
+  ~50-line addition once the audio pipeline emits a flag.
+
+- **Coarse spectral coupling.** Audio FFT bin energies modulating video
+  cache thresholds is a real and testable hypothesis. If it produces
+  better lip-sync or motion-to-music coherence, that's a concrete win.
+
+### What's hard or speculative about this
+
+- **The shared spectral basis assumption.** Audio Hartley-frequency space
+  and video VHT2 head-dim space are not the same manifold in any
+  rigorous sense. The metaphor wants them to be twin shadows of one
+  attractor; the math wants them to be unrelated until proven otherwise.
+  The empirical question is whether spectral-coupling-as-modulation
+  produces measurably better output than naive audio-conditioning. It
+  might. It might not.
+
+- **Microsecond-level sync isn't the bottleneck.** ComfyUI's video
+  diffusion has step times in the hundreds of milliseconds. Coupling
+  audio with microsecond resolution doesn't help if the video can only
+  react every 200ms. The latency budget is in the wrong place.
+
+- **C-pointer passing across Python/CUDA boundaries.** The proposal
+  bypasses Python by sharing a C struct between Voxtral and the video
+  kernel. That's operationally fragile — version skew between the two
+  C++ libraries, lifetime management of the shared struct, threading
+  hazards. Worth doing only if there's a measured win that justifies
+  the friction.
+
+- **The "1D circle is universal" claim is the load-bearing one.** If
+  audio and video really do share a 1D phase circle in some prime-
+  harmonic basis, the v5 strict 1D-circle Granite work has already
+  shipped half of it. Validate that on video first; come back to
+  multimodal coupling once we know whether the video side's 1D
+  approximation actually works in practice.
+
+### The right order of operations
+
+1. Validate v5's strict 1D-circle Granite on real Wan workflows. If
+   granite λ ≈ 0 in the v6 Lyapunov measurement, the 1D approximation
+   is empirically justified — green light for spectral coupling.
+2. Build a Python-side audio→video coupling first (no C-pointer
+   surgery): expose spectral flux from Voxtral as an input to a
+   ComfyUI node, modulate the video's `harmonic_strength` or
+   `curvature_threshold` by it. Two days of work, easy to back out.
+3. If the Python coupling produces measurable lip-sync / motion
+   coherence improvements, *then* drop into the C++ layer for the
+   pointer-sharing version.
+4. The "shared 1D phase circle" theoretical claim is paper-level
+   work; the engineering work is the modulation hookup.
+
+### Storage and architecture sketch (when the time comes)
+
+- New ComfyUI node: `ShannonPrimeMultimodalPhaseSync` that accepts an
+  AUDIO input (the Voxtral output) and emits a `PHASE_STREAM` output
+  carrying the four-field VoxtralPhaseState equivalent.
+- BlockSkip and BlockSkip-adjacent nodes accept `PHASE_STREAM` as an
+  optional input. When present, they modulate per-step:
+  - `harmonic_strength` ← scaled by `spectral_flux`
+  - `temporal_cauchy` ← OR'd with `trigger_reset`
+  - drift-gate thresholds ← shifted by `fundamental_f0` proximity
+- The C-pointer version is a v∞ optimization once the Python version
+  is validated.
+
+This is the destination if the framework is correct. It's also at
+least a six-month research project with three different fail modes.
+File it. Don't build it tonight.
+
+---
+
+## V5 priority queue (now mostly shipped — kept for archival)
 
 ### 1. Strict 1D-circle Granite reconstruction
 

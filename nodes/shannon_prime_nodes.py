@@ -1234,6 +1234,23 @@ class ShannonPrimeWanBlockSkip:
                 "subject_mask": ("MASK", ),
                 "subject_focus_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": "How much to tighten gates when subject_mask is provided. 0=ignore mask, 0.5=moderate, 1.0=aggressive."}),
+                # ── v3: per-token foveated mask application ──────────────
+                # The metaphor's "foveated heatmap" — subject pixels get
+                # full-fidelity reconstruction, background pixels get the
+                # arithmetical sketch. v3.0 lands the per-token policy on
+                # the harmonic-correction path: subject tokens get the full
+                # velocity extrapolation; background tokens get reduced
+                # extrapolation. Realizes one slice of the per-token
+                # foveation claim from the music_of_the_spheres paper.
+                #
+                # Spatial layout note: the mask is interpolated 1D to match
+                # the token count S. v3.0 doesn't know the (T, H_p, W_p)
+                # split so the interpolation is positional-density only;
+                # spatial-aware downsampling is the v3.1 follow-up.
+                "enable_per_token_harmonic": ("BOOLEAN", {"default": False,
+                    "tooltip": "v3 foveated: scale harmonic_strength per token by the subject_mask. Subject tokens get full extrapolation; background tokens get reduced. Only effective with enable_harmonic_correction=True AND subject_mask provided."}),
+                "background_harmonic_floor": ("FLOAT", {"default": 0.20, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Minimum α multiplier for background tokens (mask~0). 0=no extrapolation in background, 0.2=20% strength, 1.0=ignore mask."}),
                 "verbose": ("BOOLEAN", {"default": False,
                     "tooltip": "Print per-block HIT/MISS logs + Fisher cos_sim + Partition Z proxy"}),
             },
@@ -1261,6 +1278,7 @@ class ShannonPrimeWanBlockSkip:
               enable_cauchy_reset=False, cauchy_radius=2,
               enable_hamiltonian_gate=False, hamiltonian_threshold=0.30,
               subject_mask=None, subject_focus_strength=0.5,
+              enable_per_token_harmonic=False, background_harmonic_floor=0.20,
               verbose=False, **_ignored):
         import types
         import comfy.model_management
@@ -1422,6 +1440,39 @@ class ShannonPrimeWanBlockSkip:
 
         # Threshold boost = focus_strength * coverage * 0.05 (max +5pp tighter)
         _subject_boost = subject_focus_strength * _subject_coverage * 0.05
+
+        # v3: per-token mask cache for the foveated harmonic correction.
+        # Lazy: mask is flattened+stored at patch time, interpolated to the
+        # actual token count S on the first forward of each shape, cached.
+        _mask_flat_cpu = None
+        if (subject_mask is not None and enable_per_token_harmonic
+                and hasattr(subject_mask, 'float')):
+            try:
+                _mask_flat_cpu = subject_mask.float().flatten().detach().cpu()
+            except Exception:
+                _mask_flat_cpu = None
+        _per_token_cache: dict = {}
+
+        def _per_token_weight(S: int, device, dtype):
+            """Interpolate mask to S tokens, scaled to [floor, 1.0]. Cached."""
+            if _mask_flat_cpu is None or not enable_per_token_harmonic:
+                return None
+            key = (S, str(device), str(dtype))
+            w = _per_token_cache.get(key)
+            if w is None:
+                try:
+                    m1d = _mask_flat_cpu.view(1, 1, -1)
+                    w_cpu = torch.nn.functional.interpolate(
+                        m1d, size=S, mode='linear', align_corners=False
+                    ).view(-1).clamp(0.0, 1.0)
+                    # Linear scale into [floor, 1.0]
+                    floor = float(background_harmonic_floor)
+                    w_cpu = floor + (1.0 - floor) * w_cpu
+                    w = w_cpu.to(device=device, dtype=dtype)
+                    _per_token_cache[key] = w
+                except Exception:
+                    return None
+            return w
 
         # ── Tier-aware drift threshold (strange-attractor stack) ─────────
         # Returns the minimum rolling cos_sim required to allow a cache hit.
@@ -1732,7 +1783,14 @@ class ShannonPrimeWanBlockSkip:
                                     else:                tier_mult = 0.4   # jazz
                                 scale = (age / float(window)) * harmonic_strength * tier_mult
                                 if scale > 0.0:
-                                    y = y + scale * (y - y_prev)
+                                    # v3: per-token foveated scaling.
+                                    # y shape: [B, S, hidden]; weight shape: [S]
+                                    # Broadcast as [1, S, 1] over the sequence axis.
+                                    pt_w = _per_token_weight(y.shape[1], y.device, y.dtype)
+                                    if pt_w is not None:
+                                        y = y + scale * pt_w.view(1, -1, 1) * (y - y_prev)
+                                    else:
+                                        y = y + scale * (y - y_prev)
                                 del y_prev
                             except Exception:
                                 pass  # fail safe — use unmodified y
@@ -1972,6 +2030,9 @@ class ShannonPrimeWanBlockSkip:
             print(f"[SP BlockSkip] Subject mask: coverage={_subject_coverage:.1%} "
                   f"strength={subject_focus_strength:.2f} → "
                   f"+{_subject_boost*100:.1f}pp threshold boost on all tiers")
+        if enable_per_token_harmonic and _mask_flat_cpu is not None:
+            print(f"[SP BlockSkip] v3 per-token harmonic ON: floor={background_harmonic_floor:.2f} "
+                  f"(subject tokens: full α; background tokens: α × {background_harmonic_floor:.2f})")
         if verbose:
             print(f"[SP BlockSkip] Verbose: Fisher cos_sim + Partition Z proxy logging enabled")
 

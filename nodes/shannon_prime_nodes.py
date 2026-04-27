@@ -98,22 +98,52 @@ def _fisher_cos_sim(a: torch.Tensor, b: torch.Tensor,
                     weights: torch.Tensor) -> float:
     """
     Fisher-weighted cosine similarity between two tensors.
-    a, b: [..., head_dim] on any device/dtype.
-    weights: [head_dim] float32 on CPU (broadcast to device on first call).
+
+    Accepts either [..., head_dim] (already split into heads) or
+    [..., hidden_dim] where hidden_dim = num_heads * head_dim. In the
+    latter case (the actual self-attn output shape in Wan blocks: e.g.
+    [B, S, 5120] = 40 heads × 128 head_dim), the last axis is reshaped
+    into [..., num_heads, head_dim] before the weighted multiply so the
+    [head_dim] weight vector broadcasts correctly.
+
+    weights: [head_dim] float32 (CPU; moved to a's device on first call).
 
     Returns scalar float cos_sim weighted by the Fisher diagonal.
+
+    Bug history: prior to feat/strange-attractor-stack the function only
+    fired when verbose=True, where the caller had already arranged the
+    head split. The drift gate makes this always-on and feeds the
+    pre-split [B, S, hidden_dim] tensor; the reshape below is the fix.
     """
-    # Flatten to 2D for simplicity (batch*tokens, head_dim)
-    a_flat = a.reshape(-1, a.shape[-1]).float()
-    b_flat = b.reshape(-1, b.shape[-1]).float()
+    head_dim = int(weights.shape[0])
+    last = a.shape[-1]
+    if last == head_dim:
+        a_view = a
+        b_view = b
+    elif last % head_dim == 0:
+        # Split the last axis into (num_heads, head_dim)
+        new_shape_a = a.shape[:-1] + (last // head_dim, head_dim)
+        new_shape_b = b.shape[:-1] + (last // head_dim, head_dim)
+        a_view = a.reshape(*new_shape_a)
+        b_view = b.reshape(*new_shape_b)
+    else:
+        # Fallback: weights aren't applicable to this layout. Plain cos_sim.
+        af = a.reshape(-1).float()
+        bf = b.reshape(-1).float()
+        na, nb = af.norm(), bf.norm()
+        if na < 1e-12 or nb < 1e-12:
+            return 0.0
+        return float((af * bf).sum() / (na * nb))
+
+    # Flatten everything except the head_dim axis
+    a_flat = a_view.reshape(-1, head_dim).float()
+    b_flat = b_view.reshape(-1, head_dim).float()
 
     w = weights.to(device=a_flat.device)
 
-    # Weighted vectors
     aw = a_flat * w
     bw = b_flat * w
 
-    # Global cos_sim across all elements
     dot = (aw * bw).sum()
     norm_a = aw.norm()
     norm_b = bw.norm()
@@ -372,68 +402,120 @@ def _tiered_lattice_factors(n_freqs, freq_base=10000.0, alpha=0.17, tier='auto')
 
 def _install_lattice_rope(alpha=0.17):
     """
-    Monkey-patch comfy's Wan get_1d_rotary_pos_embed to use factored
-    lattice frequencies. Idempotent — safe to call multiple times.
+    Install factored 3D lattice RoPE. Tries the legacy module-level API
+    first (older ComfyUI versions exposed get_1d_rotary_pos_embed), then
+    falls back to patching EmbedND.forward (new API where rope is a
+    per-axis call inside an nn.Module). Idempotent.
 
-    Returns True if patching succeeded, False if Wan model not available.
+    Returns True if patching succeeded, False if neither path is available.
+
+    v2 piece 6/7: revived for current ComfyUI which removed the legacy
+    module-level helper. Math (_tiered_lattice_factors) is unchanged;
+    only the patching mechanism is updated.
     """
+    # ── Path A: legacy module-level API (older ComfyUI) ──────────────
     try:
         import comfy.ldm.wan.model as wan_model
     except ImportError:
         return False
 
-    # Don't double-patch
     if getattr(wan_model, '_sp_lattice_patched', False):
         return True
 
-    _orig_get_1d = wan_model.get_1d_rotary_pos_embed
+    if hasattr(wan_model, 'get_1d_rotary_pos_embed'):
+        _orig_get_1d = wan_model.get_1d_rotary_pos_embed
 
-    def _lattice_get_1d_rotary_pos_embed(dim, pos, theta=10000.0, **kwargs):
-        """
-        Drop-in replacement that blends lattice frequencies into Wan's
-        per-axis RoPE. Uses the dim hint to decide tier:
-          dim <= 48: likely temporal → Long-Tier
-          dim > 48:  likely spatial  → Local-Tier
+        def _lattice_get_1d_rotary_pos_embed(dim, pos, theta=10000.0, **kwargs):
+            n_freqs = dim // 2
+            tier = 'long' if dim >= 48 else 'local'
+            factors = _tiered_lattice_factors(n_freqs, freq_base=theta,
+                                              alpha=alpha, tier=tier)
+            freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+            freqs = freqs * factors
+            t = (torch.arange(pos, dtype=freqs.dtype) if isinstance(pos, int)
+                 else torch.tensor(pos, dtype=freqs.dtype)
+                 if not isinstance(pos, torch.Tensor) else pos.float())
+            freqs_outer = torch.outer(t, freqs)
+            return torch.cat([freqs_outer.cos(), freqs_outer.sin()], dim=-1)
 
-        The blended frequencies are applied via freq_factors on the
-        geometric baseline — same mechanism as sp_inject_freqs.py.
-        """
-        n_freqs = dim // 2
+        wan_model.get_1d_rotary_pos_embed = _lattice_get_1d_rotary_pos_embed
+        wan_model._sp_lattice_patched = True
+        print(f"[Shannon-Prime] Lattice RoPE installed (legacy API, α={alpha})")
+        print(f"[Shannon-Prime]   Temporal → Long-Tier, Spatial → Local-Tier")
+        return True
 
-        # Determine tier from dimension:
-        # Wan 2.2 5B: d_t=48, d_h=40, d_w=40 (total 128)
-        # Temporal dim is typically the largest per-axis allocation
-        if dim >= 48:
-            tier = 'long'    # temporal: causal anchors
-        else:
-            tier = 'local'   # spatial: fine detail
+    # ── Path B: new API — patch comfy.ldm.flux.layers.EmbedND.forward ─
+    # WanModel uses EmbedND(dim=d, theta, axes_dim=[d-4*(d//6), 2*(d//6), 2*(d//6)]).
+    # axes_dim[0] is temporal (largest), [1]/[2] are spatial (equal). EmbedND.forward
+    # iterates axes and calls rope(ids[..., i], axes_dim[i], theta).
+    #
+    # We replace the forward to inject per-axis lattice factors on the omega.
+    try:
+        from comfy.ldm.flux import layers as flux_layers
+        from comfy.ldm.flux.math import rope as orig_rope
+    except ImportError:
+        print("[Shannon-Prime] Lattice RoPE: neither legacy nor new API available")
+        return False
 
-        factors = _tiered_lattice_factors(n_freqs, freq_base=theta,
-                                          alpha=alpha, tier=tier)
+    if getattr(flux_layers.EmbedND, '_sp_lattice_patched', False):
+        wan_model._sp_lattice_patched = True
+        return True
 
-        # Modify theta per-dim: effective_theta[j] = theta / factor[j]
-        # This is equivalent to applying freq_factors in ggml_rope_ext
-        import types
-        import functools
+    _orig_embedND_forward = flux_layers.EmbedND.forward
 
-        # Call original but with modified frequencies
-        # The cleanest path: compute the embedding ourselves using the
-        # blended frequencies, matching the original's output format.
-        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-        freqs = freqs * factors  # apply lattice blend
+    # Cache for per-(dim, theta, tier) factor tensors
+    _lattice_factor_cache = {}
 
-        t = torch.arange(pos, dtype=freqs.dtype) if isinstance(pos, int) \
-            else torch.tensor(pos, dtype=freqs.dtype) if not isinstance(pos, torch.Tensor) \
-            else pos.float()
+    def _get_factors(dim, theta, tier):
+        key = (int(dim), float(theta), tier, float(alpha))
+        f = _lattice_factor_cache.get(key)
+        if f is None:
+            n_freqs = dim // 2
+            f = _tiered_lattice_factors(n_freqs, freq_base=theta,
+                                        alpha=alpha, tier=tier)
+            _lattice_factor_cache[key] = f
+        return f
 
-        freqs_outer = torch.outer(t, freqs)
-        emb = torch.cat([freqs_outer.cos(), freqs_outer.sin()], dim=-1)
-        return emb
+    def _lattice_embedND_forward(self, ids):
+        # ids shape: [..., n_axes]. n_axes = 3 for Wan 3D RoPE, 2 for Flux 2D.
+        n_axes = ids.shape[-1]
+        embs = []
+        device = ids.device
+        for i in range(n_axes):
+            axis_dim = self.axes_dim[i]
+            # Tier routing: 3D → axis 0 = temporal (long), 1/2 = spatial (local).
+            # 2D (Flux) → both axes = local. 1D → auto.
+            if n_axes == 3:
+                tier = 'long' if i == 0 else 'local'
+            elif n_axes == 2:
+                tier = 'local'
+            else:
+                tier = 'auto'
 
-    wan_model.get_1d_rotary_pos_embed = _lattice_get_1d_rotary_pos_embed
+            factors = _get_factors(axis_dim, self.theta, tier).to(device)
+            # Reproduce flux.math.rope with omega multiplied by lattice factors:
+            # omega = 1/theta**scale  →  omega_lattice = omega * factors
+            scale = torch.linspace(0, (axis_dim - 2) / axis_dim,
+                                   steps=axis_dim // 2,
+                                   dtype=torch.float64, device=device)
+            omega = (1.0 / (self.theta ** scale)).to(torch.float64) * factors.to(torch.float64)
+            pos_axis = ids[..., i].to(torch.float32)
+            out = torch.einsum("...n,d->...nd", pos_axis, omega.to(torch.float32))
+            out = torch.stack([torch.cos(out), -torch.sin(out),
+                               torch.sin(out),  torch.cos(out)], dim=-1)
+            # Reshape (..., n, d, 4) → (..., n, d, 2, 2) to match original rope output
+            new_shape = out.shape[:-1] + (2, 2)
+            out = out.reshape(*new_shape).to(torch.float32)
+            embs.append(out)
+
+        return torch.cat(embs, dim=-3).unsqueeze(1)
+
+    flux_layers.EmbedND.forward = _lattice_embedND_forward
+    flux_layers.EmbedND._sp_lattice_patched = True
     wan_model._sp_lattice_patched = True
-    print(f"[Shannon-Prime] Factored 3D Lattice RoPE installed (α={alpha})")
-    print(f"[Shannon-Prime]   Temporal → Long-Tier, Spatial → Local-Tier")
+    print(f"[Shannon-Prime] Lattice RoPE installed (EmbedND API, α={alpha})")
+    print(f"[Shannon-Prime]   3D: temporal → Long-Tier, spatial → Local-Tier")
+    print(f"[Shannon-Prime]   2D: both axes → Local-Tier (Flux compatible)")
     return True
 
 
@@ -1025,6 +1107,98 @@ class ShannonPrimeWanBlockSkip:
                     "tooltip": "fp16=all caches fp16. fp8=all fp8. mixed=tier-0/1 fp16 (precision), tier-2/3 fp8 (saves memory where approximation is already aggressive)."}),
                 "cache_compress": (["raw", "vht2"], {"default": "raw",
                     "tooltip": "raw=store cached tensors as-is (default, safe). vht2=VHT2 spectral compression via pre-allocated memory pool (~3.5x memory reduction, ~0 quality loss). Pool eliminates the VRAM fragmentation that disabled VHT2 in Phase 15 LEAN."}),
+                # ── Strange-attractor stack — gated, default OFF ─────────
+                # Wires the rolling Fisher cos_sim into the cache-hit gate.
+                # Currently the docstring promises this but the gate is age+streak only.
+                # When enabled, each block tracks an EMA of measured cos_sim across
+                # misses; the next hit is allowed only if rolling_sim >= tier threshold.
+                # Tier thresholds default to the values implied by the existing streak
+                # limits (granite>0.95, sand>0.90, jazz>0.85), so behavior is conservative.
+                # Loosen granite to extend streaks; tighten jazz to refresh more eagerly.
+                "enable_drift_gate": ("BOOLEAN", {"default": False,
+                    "tooltip": "Strange-attractor stack: gate cache hits by rolling Fisher cos_sim. OFF = current age+streak only behavior (default, ship-safe)."}),
+                "granite_threshold": ("FLOAT", {"default": 0.95, "min": 0.50, "max": 1.00, "step": 0.01,
+                    "tooltip": "Min rolling cos_sim to allow cache hit on tier-0 (L00-L03). Lower = looser leash, longer streaks. Only used when enable_drift_gate=True."}),
+                "sand_threshold": ("FLOAT", {"default": 0.90, "min": 0.50, "max": 1.00, "step": 0.01,
+                    "tooltip": "Min rolling cos_sim for tier-1 (L04-L08). Only used when enable_drift_gate=True."}),
+                "jazz_threshold": ("FLOAT", {"default": 0.85, "min": 0.50, "max": 1.00, "step": 0.01,
+                    "tooltip": "Min rolling cos_sim for tier-2/3 (L09+). Only used when enable_drift_gate=True."}),
+                # Piece 2/4: adaptive sigma-streak. At high sigma (composition forming)
+                # streaks stay short; at low sigma (locked composition, texture only)
+                # streaks extend. Cooperates with ShannonPrimeWanSigmaSwitch — reads
+                # the same _sp_sigma_state if present, otherwise installs its own
+                # model_function_wrapper to capture sigma. SVI non-monotonic schedules
+                # are handled by sigma_max/sigma_min rolling min/max.
+                "enable_sigma_streak": ("BOOLEAN", {"default": False,
+                    "tooltip": "Strange-attractor stack: streak limits scale with sigma. Granite extends 7-15, sand 4-9, jazz 3-6 across sigma range. OFF = current static 10/5/3 behavior."}),
+                # Piece 3/4: twin-prime borrowing on decode path. After Möbius reorder
+                # and skeleton extraction, twin-prime spectral coefficients (3-5,
+                # 11-13, 17-19, ...) are arithmetic neighbors. When dequantized
+                # values disagree past a threshold, weighted-average pulls outliers
+                # back toward consensus. Decode-only — encoded skeleton bytes are
+                # untouched, reversibility property of compress() unchanged.
+                # Worst case at α=0 = identity. Only applies when cache_compress=vht2.
+                "enable_twin_borrow": ("BOOLEAN", {"default": False,
+                    "tooltip": "Strange-attractor stack: twin-prime borrowing on VHT2 decode. 9 disjoint pairs at head_dim=128 (3-5, 11-13, 17-19, 29-31, ...). Only takes effect when cache_compress=vht2."}),
+                "twin_alpha": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 0.5, "step": 0.01,
+                    "tooltip": "Borrow strength. 0=no change, 0.5=full pair average. Bounded change: |Δc| ≤ α/2·|c_i-c_j|."}),
+                "twin_threshold": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Only borrow when relative |c_i-c_j|/max exceeds this. 0.0=always borrow, 0.1=outliers only."}),
+                "twin_borrow_mode": (["symmetric", "low_anchor", "high_anchor"], {"default": "symmetric",
+                    "tooltip": "v2 piece 3: borrow asymmetry. symmetric=both pull to mean. low_anchor=lower-prime fixed, higher pulls toward it. high_anchor=inverse."}),
+                # ── v2 piece 1/5: harmonic correction on cache hits ──────
+                # Sally as harmonic oscillator near equilibrium: when input
+                # drift is small the trajectory is approximately linear, so a
+                # cache hit can be corrected by extrapolating along the last
+                # observed (curr - prev) velocity. y_hit = y_curr + (age/window)
+                # * strength * (y_curr - y_prev). Costs one extra cached y per
+                # block. At strength=0 this is identity (current behavior).
+                "enable_harmonic_correction": ("BOOLEAN", {"default": False,
+                    "tooltip": "Linearly extrapolate y on cache hit using (y_curr - y_prev) velocity. Costs ~2× BlockSkip cache memory when on."}),
+                "harmonic_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.5, "step": 0.05,
+                    "tooltip": "Strength of the linear correction. 0=no correction (identity), 0.5=conservative half-step, 1.0=full extrapolation."}),
+                # ── v2 piece 2/7: layer-dependent skeleton fraction ──────
+                # Granite tier sits at cos_sim>0.999 across many steps —
+                # there's room for higher fidelity (more skeleton coefficients
+                # kept). Jazz tier is volatile, can survive more aggressive
+                # pruning. Defaults to uniform 0.30 across all three so
+                # existing behavior is preserved.
+                "enable_tier_skeleton": ("BOOLEAN", {"default": False,
+                    "tooltip": "Use per-tier skeleton fractions for VHT2 compression. Only takes effect when cache_compress=vht2."}),
+                "granite_skel_frac": ("FLOAT", {"default": 0.50, "min": 0.05, "max": 1.0, "step": 0.05,
+                    "tooltip": "Skeleton fraction for tier-0 (L00-L03). Higher = more fidelity. Default 0.50 vs uniform 0.30."}),
+                "sand_skel_frac": ("FLOAT", {"default": 0.30, "min": 0.05, "max": 1.0, "step": 0.05,
+                    "tooltip": "Skeleton fraction for tier-1 (L04-L08). Default 0.30 = current uniform."}),
+                "jazz_skel_frac": ("FLOAT", {"default": 0.20, "min": 0.05, "max": 1.0, "step": 0.05,
+                    "tooltip": "Skeleton fraction for tier-2/3 (L09+). Lower = more aggressive. Default 0.20 vs uniform 0.30."}),
+                # ── v2 piece 4/7: Fisher-Hessian curvature gate ──────────
+                # Tracks second derivative of rolling cos_sim. If sim is
+                # accelerating downward (rate-of-decline increasing), force
+                # a miss earlier than the static threshold would. Catches
+                # "about to fall off the attractor" before cos_sim itself
+                # drops below threshold.
+                "enable_curvature_gate": ("BOOLEAN", {"default": False,
+                    "tooltip": "Force a miss when rolling_sim acceleration goes below curvature_threshold (sim is rapidly accelerating downward). Layered on top of the static drift gate."}),
+                "curvature_threshold": ("FLOAT", {"default": -0.05, "min": -0.30, "max": 0.0, "step": 0.01,
+                    "tooltip": "Min acceleration. -0.05 = sim's rate-of-decline jumped by 5pp between miss steps."}),
+                # ── v2 piece 5/7: Cauchy reset hook ──────────────────────
+                # When a block's drift/curvature gate forces a miss, the
+                # trajectory has escaped the basin near that block. Likely
+                # the same is happening for nearby same-tier blocks. Invalidate
+                # them too so they refresh together on the next step rather
+                # than each one tripping its own gate one-by-one.
+                "enable_cauchy_reset": ("BOOLEAN", {"default": False,
+                    "tooltip": "When a drift- or curvature-induced miss fires, also invalidate ±cauchy_radius neighbor blocks within the same tier."}),
+                "cauchy_radius": ("INT", {"default": 2, "min": 0, "max": 10,
+                    "tooltip": "Block-index radius for the reset. 0=no neighbors, 2=±2 same-tier neighbors, etc."}),
+                # ── v2 piece 7/7: foveated mask input ────────────────────
+                # Optional MASK that biases the gates toward stricter behavior
+                # when a subject of interest is identified. v1 uses scalar
+                # coverage: tighter thresholds + shorter streaks proportional
+                # to mask coverage. Per-token application is the next step.
+                "subject_mask": ("MASK", ),
+                "subject_focus_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "How much to tighten gates when subject_mask is provided. 0=ignore mask, 0.5=moderate, 1.0=aggressive."}),
                 "verbose": ("BOOLEAN", {"default": False,
                     "tooltip": "Print per-block HIT/MISS logs + Fisher cos_sim + Partition Z proxy"}),
             },
@@ -1038,6 +1212,17 @@ class ShannonPrimeWanBlockSkip:
               tier_2_window=0, tier_3_window=0,
               cache_ffn=False, cache_dtype="fp16",
               cache_compress="raw",
+              enable_drift_gate=False,
+              granite_threshold=0.95, sand_threshold=0.90, jazz_threshold=0.85,
+              enable_sigma_streak=False,
+              enable_twin_borrow=False, twin_alpha=0.10, twin_threshold=0.0,
+              twin_borrow_mode="symmetric",
+              enable_harmonic_correction=False, harmonic_strength=0.5,
+              enable_tier_skeleton=False,
+              granite_skel_frac=0.50, sand_skel_frac=0.30, jazz_skel_frac=0.20,
+              enable_curvature_gate=False, curvature_threshold=-0.05,
+              enable_cauchy_reset=False, cauchy_radius=2,
+              subject_mask=None, subject_focus_strength=0.5,
               verbose=False, **_ignored):
         import types
         import comfy.model_management
@@ -1075,6 +1260,7 @@ class ShannonPrimeWanBlockSkip:
                             _obj.get("ffn_cache", {}).clear()
                             _obj.get("step_cached", {}).clear()
                             _obj.get("hit_streak", {}).clear()
+                            _obj.get("prev_attn_cache", {}).clear()
                             _cleared += 1
                     except ValueError:
                         pass
@@ -1119,19 +1305,42 @@ class ShannonPrimeWanBlockSkip:
         _vht2_bridge = None
         _vht2_pool = None
         _skel_mask = None
+        # v2 piece 2/7: per-tier skeleton masks (granite/sand/jazz)
+        _skel_mask_granite = None
+        _skel_mask_sand = None
+        _skel_mask_jazz = None
         if _use_vht2:
             try:
                 from vht2_cuda_bridge import VHT2Bridge
                 _vht2_bridge = VHT2Bridge(skeleton_frac=0.30, device="cpu")
                 _skel_mask = _vht2_bridge.skeleton_mask_128()
                 _skel_size = int(_skel_mask.sum().item())
-                # Pool will be lazily initialized on first miss (need device)
-                print(f"[SP BlockSkip] VHT2 compression enabled: "
-                      f"skeleton={_skel_size}/128 ({_skel_size/128:.0%})")
+                if enable_tier_skeleton:
+                    _skel_mask_granite = _vht2_bridge.skeleton_mask_128(frac=granite_skel_frac)
+                    _skel_mask_sand    = _vht2_bridge.skeleton_mask_128(frac=sand_skel_frac)
+                    _skel_mask_jazz    = _vht2_bridge.skeleton_mask_128(frac=jazz_skel_frac)
+                    print(f"[SP BlockSkip] VHT2 compression enabled (tier-aware): "
+                          f"granite={int(_skel_mask_granite.sum().item())}/128 "
+                          f"sand={int(_skel_mask_sand.sum().item())}/128 "
+                          f"jazz={int(_skel_mask_jazz.sum().item())}/128")
+                else:
+                    print(f"[SP BlockSkip] VHT2 compression enabled: "
+                          f"skeleton={_skel_size}/128 ({_skel_size/128:.0%})")
             except ImportError:
                 print("[SP BlockSkip] WARNING: vht2_cuda_bridge not available, "
                       "falling back to raw caching")
                 _use_vht2 = False
+
+        # Returns the right skeleton mask for a given block index. When the
+        # tier toggle is off, all blocks share the uniform _skel_mask.
+        def _mask_for(i):
+            if not enable_tier_skeleton or _skel_mask_granite is None:
+                return _skel_mask
+            if i < 4:
+                return _skel_mask_granite
+            if i < 9:
+                return _skel_mask_sand
+            return _skel_mask_jazz
         _n_blocks_total = n_blocks  # for partition Z summary
 
         # Shared state across all patched blocks
@@ -1143,17 +1352,148 @@ class ShannonPrimeWanBlockSkip:
             'ffn_cache':      {},       # block_idx -> FFN pre-gate y (CPU fp16) [turbo]
             'step_cached':    {},
             'fisher_sim':     {},       # block_idx -> last Fisher cos_sim (diagnostic)
+            'rolling_sim':    {},       # block_idx -> EMA of fisher cos_sim across misses
+            'prev_attn_cache':{},       # block_idx -> previous miss's y (for harmonic correction)
+            'delta_sim':      {},       # v2 piece 4: last (rolling - prev_rolling) per block
+            'curvature_violation': {},  # v2 piece 4: per-block flag set when accel < threshold
         }
+
+        # ── v2 piece 7/7: foveated mask coverage ─────────────────────────
+        # Compute scalar coverage from the optional MASK input. When provided
+        # and non-trivial, the coverage scales the per-tier drift thresholds
+        # upward (stricter), causing more eager refreshes during subject-heavy
+        # frames. v1 = scalar; per-token application is the natural follow-up.
+        _subject_coverage = 0.0
+        if subject_mask is not None and subject_focus_strength > 0.0:
+            try:
+                if hasattr(subject_mask, 'float'):
+                    m = subject_mask.float()
+                    _subject_coverage = float(m.mean().item())
+                # Cap to [0, 1]
+                _subject_coverage = max(0.0, min(1.0, _subject_coverage))
+            except Exception:
+                _subject_coverage = 0.0
+
+        # Threshold boost = focus_strength * coverage * 0.05 (max +5pp tighter)
+        _subject_boost = subject_focus_strength * _subject_coverage * 0.05
+
+        # ── Tier-aware drift threshold (strange-attractor stack) ─────────
+        # Returns the minimum rolling cos_sim required to allow a cache hit.
+        # Granite (L00-L03) cos_sim parks at 0.999+ across many steps, so it
+        # tolerates a looser threshold; jazz (L16+) is volatile and warrants
+        # a stricter one. Used only when enable_drift_gate=True.
+        def _tier_threshold(i):
+            if i < 4:
+                base = granite_threshold
+            elif i < 9:
+                base = sand_threshold
+            else:
+                base = jazz_threshold
+            # v2 piece 7/7: subject mask tightens the threshold
+            return min(0.999, base + _subject_boost)
+
+        # ── v2 piece 5/7: Cauchy reset helper ────────────────────────────
+        # When a drift/curvature gate forces a miss on block triggering, also
+        # invalidate cached state for ±cauchy_radius neighbors within the same
+        # tier so they refresh together on the next step. Same-tier check uses
+        # the {0..3, 4..8, 9..15, 16..} bands as elsewhere.
+        def _cauchy_reset(triggering, st):
+            if triggering < 4:
+                tier_lo, tier_hi = 0, 3
+            elif triggering < 9:
+                tier_lo, tier_hi = 4, 8
+            elif triggering < 16:
+                tier_lo, tier_hi = 9, 15
+            else:
+                tier_lo, tier_hi = 16, 9999
+            lo = max(triggering - cauchy_radius, tier_lo)
+            hi = min(triggering + cauchy_radius, tier_hi)
+            cleared = 0
+            for bi in range(lo, hi + 1):
+                if bi == triggering:
+                    continue
+                for k in ('attn_cache', 'xattn_cache', 'ffn_cache',
+                          'prev_attn_cache', 'step_cached', 'hit_streak',
+                          'rolling_sim', 'delta_sim', 'curvature_violation'):
+                    if bi in st.get(k, {}):
+                        st[k].pop(bi, None)
+                        cleared += 1
+            return cleared
+
+        # ── Sigma capture (cooperative with ShannonPrimeWanSigmaSwitch) ──
+        # If SigmaSwitch is upstream it has already populated _sp_sigma_state
+        # with current_sigma / sigma_max / sigma_min. Reuse it. Otherwise
+        # install our own model_function_wrapper to capture the same shape.
+        # Only active when enable_sigma_streak=True (sigma read happens per
+        # step regardless, but streak_limit only scales when the toggle is on).
+        sigma_state = getattr(patched, '_sp_sigma_state', None)
+        if enable_sigma_streak and sigma_state is None:
+            sigma_state = {
+                'current_sigma': [None],
+                'sigma_max':     [None],
+                'sigma_min':     [None],
+                'step_count':    [0],
+            }
+
+            def _sp_blockskip_sigma_wrapper(apply_model_func, args_dict):
+                timestep = args_dict.get("timestep", None)
+                if timestep is not None:
+                    try:
+                        sig = float(timestep.flatten()[0])
+                        sigma_state['current_sigma'][0] = sig
+                        sigma_state['step_count'][0] += 1
+                        if sigma_state['sigma_max'][0] is None:
+                            sigma_state['sigma_max'][0] = sig
+                            sigma_state['sigma_min'][0] = sig
+                        else:
+                            sigma_state['sigma_max'][0] = max(sigma_state['sigma_max'][0], sig)
+                            sigma_state['sigma_min'][0] = min(sigma_state['sigma_min'][0], sig)
+                    except Exception:
+                        pass
+                return apply_model_func(args_dict["input"], args_dict["timestep"],
+                                        **args_dict.get("c", {}))
+
+            patched.set_model_unet_function_wrapper(_sp_blockskip_sigma_wrapper)
+            patched._sp_sigma_state = sigma_state
+
+        # Adaptive streak: at high-sigma end keep short, at low-sigma end extend.
+        # Returns int streak limit given a normalized sigma (1.0=high, 0.0=low).
+        # Per-tier ranges: granite 7-15, sand 4-9, jazz 3-6.
+        # Falls back to static 10/5/3 if sigma_state not yet populated.
+        def _adaptive_streak(i, sigma_norm):
+            if sigma_norm is None:
+                if i < 4: return 10
+                if i < 9: return 5
+                return 3
+            inv = 1.0 - max(0.0, min(1.0, sigma_norm))  # 0.0 at high, 1.0 at low
+            if i < 4:
+                return int(round(7 + 8 * inv))
+            if i < 9:
+                return int(round(4 + 5 * inv))
+            return int(round(3 + 3 * inv))
 
         def make_patched_forward(orig_forward, block_idx, blk):
             window = get_window(block_idx)
             # Streak limit: force a miss every N hits to refresh cache.
+            # Static defaults — overridden per-step when enable_sigma_streak=True.
             if block_idx < 4:
-                _streak_limit = 10    # tier-0: sim>0.95
+                _static_streak_limit = 10    # tier-0: sim>0.95
             elif block_idx < 9:
-                _streak_limit = 5     # tier-1: sim>0.90
+                _static_streak_limit = 5     # tier-1: sim>0.90
             else:
-                _streak_limit = 3     # tier-2: volatile, refresh often
+                _static_streak_limit = 3     # tier-2: volatile, refresh often
+
+            def _current_streak_limit():
+                if not enable_sigma_streak or sigma_state is None:
+                    return _static_streak_limit
+                sig = sigma_state['current_sigma'][0]
+                s_max = sigma_state['sigma_max'][0]
+                s_min = sigma_state['sigma_min'][0]
+                if sig is None or s_max is None or s_min is None:
+                    return _static_streak_limit
+                rng = max(s_max - s_min, 1e-6)
+                sig_norm = (sig - s_min) / rng  # 1.0=high, 0.0=low
+                return _adaptive_streak(block_idx, sig_norm)
 
             def patched_forward(x, e, freqs, context,
                                 context_img_len=257,
@@ -1171,8 +1511,13 @@ class ShannonPrimeWanBlockSkip:
 
                 # ── Print run info on step 1 ────────────────────────────────
                 if block_idx == 0 and step == 1:
+                    # x.dtype is the diffusion latent's compute dtype (Wan locks
+                    # this to fp16 regardless of SP settings). The cache storage
+                    # dtype (fp16/fp8/mixed) is the cache_dtype param and is
+                    # printed in the summary line below.
                     print(f"[SP BlockSkip] step=1 x.shape={tuple(x.shape)}  "
-                          f"tokens={x.shape[1]}  dtype={x.dtype}  device={x.device}")
+                          f"tokens={x.shape[1]}  latent_dtype={x.dtype}  "
+                          f"cache_dtype={cache_dtype}  device={x.device}")
 
                 # ── Recompute adaLN modulation (always — cheap) ─────────────
                 cast = comfy.model_management.cast_to
@@ -1203,11 +1548,48 @@ class ShannonPrimeWanBlockSkip:
                     cached_xa = None
                     cached_ff = None
 
+                # ── Drift gate (strange-attractor stack) ────────────────────
+                # When enabled, the rolling Fisher cos_sim must clear the
+                # tier-specific threshold for a hit to be allowed. The rolling
+                # value is seeded at 1.0 (full coherence), so the gate is a
+                # no-op until the first miss measures actual drift.
+                if enable_drift_gate:
+                    rolling = state['rolling_sim'].get(block_idx, 1.0)
+                    drift_ok = (rolling >= _tier_threshold(block_idx))
+                else:
+                    drift_ok = True
+
+                # v2 piece 4/7: curvature gate. If the most-recent miss
+                # measured a strong negative acceleration in rolling_sim,
+                # the trajectory is leaving the basin — deny the next hit
+                # to force a refresh ahead of an actual threshold breach.
+                if enable_curvature_gate:
+                    curvature_ok = not state['curvature_violation'].get(block_idx, False)
+                else:
+                    curvature_ok = True
+
                 # ── CACHE HIT ──────────────────────────────────────────────
+                _streak_limit = _current_streak_limit()
+                # Detect a "would have hit but for the gates" — that's the
+                # signal for a Cauchy reset to fire (real basin escape, not
+                # just window/streak expiry).
+                gate_forced_miss = (cached_y is not None
+                                    and cached_xa is not None
+                                    and age >= 0 and age < window
+                                    and streak < _streak_limit
+                                    and not (drift_ok and curvature_ok))
+                if enable_cauchy_reset and gate_forced_miss and cauchy_radius > 0:
+                    n_cleared = _cauchy_reset(block_idx, state)
+                    if verbose and n_cleared > 0:
+                        print(f"[SP BlockSkip] B{block_idx:02d} CAUCHY RESET — "
+                              f"cleared {n_cleared} state entries on neighbors")
+
                 hit = (cached_y is not None
                        and cached_xa is not None
                        and age >= 0 and age < window
-                       and streak < _streak_limit)
+                       and streak < _streak_limit
+                       and drift_ok
+                       and curvature_ok)
 
                 # ── Helpers: store/load with per-block dtype ──��───────────
                 _blk_dtype = _dtype_for(block_idx)
@@ -1219,6 +1601,11 @@ class ShannonPrimeWanBlockSkip:
                         return t.to(dtype=x.dtype).to(device=x.device)
                     return t.to(device=x.device, dtype=x.dtype)
 
+                # v2 piece 2/7: tier-appropriate skeleton mask for this block
+                _block_skel_mask = _mask_for(block_idx)
+                _block_skel_size = (int(_block_skel_mask.sum().item())
+                                    if _block_skel_mask is not None else 0)
+
                 def _store(t):
                     if _use_vht2 and _vht2_bridge is not None:
                         # VHT2 compress: butterfly → skeleton extract → CPU
@@ -1226,7 +1613,7 @@ class ShannonPrimeWanBlockSkip:
                         try:
                             flat = t.detach().reshape(-1, _head_dim)
                             spectral = _vht2_bridge.forward(flat.float())
-                            compressed = spectral[:, _skel_mask].to(dtype=_blk_dtype).cpu()
+                            compressed = spectral[:, _block_skel_mask].to(dtype=_blk_dtype).cpu()
                             return compressed
                         except Exception:
                             pass  # fall through to raw
@@ -1235,12 +1622,20 @@ class ShannonPrimeWanBlockSkip:
                 def _load_maybe_vht2(t):
                     """Load tensor, decompressing from VHT2 if compressed."""
                     if (_use_vht2 and _vht2_bridge is not None
-                            and t.shape[-1] != _head_dim):
+                            and t.shape[-1] != _head_dim
+                            and t.shape[-1] == _block_skel_size):
                         # Compressed: [N, skeleton_size] → decompress
                         try:
                             full = torch.zeros(t.shape[0], _head_dim,
                                                dtype=torch.float32)
-                            full[:, _skel_mask] = t.float()
+                            full[:, _block_skel_mask] = t.float()
+                            # Strange-attractor stack piece 3/4: twin-prime borrow
+                            # before the inverse butterfly (decode-only).
+                            if enable_twin_borrow:
+                                full = _vht2_bridge.apply_twin_borrow(
+                                    full, _block_skel_mask,
+                                    alpha=twin_alpha, threshold=twin_threshold,
+                                    mode=twin_borrow_mode)
                             recon = _vht2_bridge.forward(full)  # inverse
                             return recon.to(device=x.device, dtype=x.dtype)
                         except Exception:
@@ -1250,6 +1645,23 @@ class ShannonPrimeWanBlockSkip:
                 if hit:
                     # Self-attn: cached pre-gate y + current step's gate
                     y = _load_maybe_vht2(cached_y)
+
+                    # v2 piece 1/5: harmonic correction.
+                    # Linear forward-Euler extrapolation along the (curr - prev)
+                    # velocity, scaled by how far into the cache window we are.
+                    # At age=0 or strength=0 this is identity.
+                    if enable_harmonic_correction and harmonic_strength > 0.0:
+                        prev_y_storage = state['prev_attn_cache'].get(block_idx)
+                        if prev_y_storage is not None and window > 0:
+                            try:
+                                y_prev = _load_maybe_vht2(prev_y_storage)
+                                scale = (age / float(window)) * harmonic_strength
+                                if scale > 0.0:
+                                    y = y + scale * (y - y_prev)
+                                del y_prev
+                            except Exception:
+                                pass  # fail safe — use unmodified y
+
                     x = torch.addcmul(x.contiguous(), y,
                                       repeat_e(e_mods[2], x))
                     del y
@@ -1291,12 +1703,41 @@ class ShannonPrimeWanBlockSkip:
                     # Fisher diagonal approximation. This measures "information
                     # drift" — drift along the arithmetical skeleton dimensions
                     # weighted higher than noise dimensions.
+                    #
+                    # When enable_drift_gate is on, this measurement is always-on
+                    # (not just verbose) and feeds the EMA-smoothed rolling_sim
+                    # used to gate the next step's hit decision. EMA α=0.5 gives
+                    # ~2-step memory: enough to filter single-step blips but
+                    # responsive enough to catch a real attractor escape.
                     prev_y = state['attn_cache'].get(block_idx)
-                    if prev_y is not None and verbose:
+                    if prev_y is not None and (verbose or enable_drift_gate or enable_curvature_gate):
                         prev_on_dev = _load(prev_y)
                         f_sim = _fisher_cos_sim(y, prev_on_dev, _fisher_w)
                         state['fisher_sim'][block_idx] = f_sim
+                        if enable_drift_gate or enable_curvature_gate:
+                            prev_rolling = state['rolling_sim'].get(block_idx, 1.0)
+                            new_rolling = 0.5 * prev_rolling + 0.5 * f_sim
+                            state['rolling_sim'][block_idx] = new_rolling
+
+                            # v2 piece 4: track second derivative (acceleration)
+                            if enable_curvature_gate:
+                                curr_delta = new_rolling - prev_rolling
+                                prev_delta = state['delta_sim'].get(block_idx, 0.0)
+                                accel = curr_delta - prev_delta
+                                state['delta_sim'][block_idx] = curr_delta
+                                # Negative accel below threshold = sim accelerating
+                                # downward = trajectory escaping basin. Set flag
+                                # so next hit decision denies the hit.
+                                state['curvature_violation'][block_idx] = (
+                                    accel < curvature_threshold)
                         del prev_on_dev
+
+                    # v2 piece 1/5: capture prev y before overwriting,
+                    # for harmonic correction on subsequent hits.
+                    if enable_harmonic_correction:
+                        prev_storage = state['attn_cache'].get(block_idx)
+                        if prev_storage is not None:
+                            state['prev_attn_cache'][block_idx] = prev_storage
 
                     state['attn_cache'][block_idx] = _store(y)
 
@@ -1384,6 +1825,39 @@ class ShannonPrimeWanBlockSkip:
             print(f"[SP BlockSkip] TURBO: on HIT, ENTIRE block skipped (adaLN + 3 transfers)")
         else:
             print(f"[SP BlockSkip] On HIT: adaLN + FFN. Self-attn + cross-attn SKIPPED.")
+        if enable_drift_gate:
+            print(f"[SP BlockSkip] Drift gate ON: granite>={granite_threshold:.2f} "
+                  f"sand>={sand_threshold:.2f} jazz>={jazz_threshold:.2f} "
+                  f"(rolling Fisher cos_sim, EMA α=0.5)")
+        if enable_sigma_streak:
+            owns_wrapper = sigma_state is not None and not hasattr(model, '_sp_sigma_state')
+            src = "own wrapper" if owns_wrapper else "SigmaSwitch upstream"
+            print(f"[SP BlockSkip] Sigma-streak ON: granite 7-15, sand 4-9, jazz 3-6 "
+                  f"across sigma range (sigma source: {src})")
+        if enable_twin_borrow:
+            if _use_vht2:
+                print(f"[SP BlockSkip] Twin-prime borrow ON: α={twin_alpha:.2f} "
+                      f"threshold={twin_threshold:.2f} mode={twin_borrow_mode} "
+                      f"(decode-only, 9 disjoint pairs)")
+            else:
+                print(f"[SP BlockSkip] Twin-prime borrow requested but cache_compress=raw — no-op")
+        if enable_harmonic_correction:
+            print(f"[SP BlockSkip] Harmonic correction ON: strength={harmonic_strength:.2f} "
+                  f"(linear extrapolation, ~2× cache memory)")
+        if enable_tier_skeleton and _use_vht2:
+            print(f"[SP BlockSkip] Tier-aware skeleton ON: "
+                  f"granite={granite_skel_frac:.0%}, sand={sand_skel_frac:.0%}, "
+                  f"jazz={jazz_skel_frac:.0%}")
+        if enable_curvature_gate:
+            print(f"[SP BlockSkip] Curvature gate ON: threshold={curvature_threshold:+.3f} "
+                  f"(force miss when sim acceleration drops below)")
+        if enable_cauchy_reset:
+            print(f"[SP BlockSkip] Cauchy reset ON: radius={cauchy_radius} "
+                  f"(invalidate ±{cauchy_radius} same-tier neighbors on gated miss)")
+        if subject_mask is not None and _subject_coverage > 0.0:
+            print(f"[SP BlockSkip] Subject mask: coverage={_subject_coverage:.1%} "
+                  f"strength={subject_focus_strength:.2f} → "
+                  f"+{_subject_boost*100:.1f}pp threshold boost on all tiers")
         if verbose:
             print(f"[SP BlockSkip] Verbose: Fisher cos_sim + Partition Z proxy logging enabled")
 
@@ -1422,13 +1896,23 @@ class ShannonPrimeWanCacheFlush:
                 "model":   ("MODEL",),
                 "samples": ("LATENT",),
             },
+            "optional": {
+                # v2 ergonomic: when ON, also evict the loaded model from VRAM
+                # (equivalent to ComfyUI's /free endpoint with unload_models=True
+                # and free_memory=True). Default OFF preserves prior behavior:
+                # ComfyUI keeps the model resident between runs to avoid reload
+                # cost. Turn ON if you want VRAM back after each generation
+                # (useful for switching workflows or running other GPU tasks).
+                "auto_free_after_run": ("BOOLEAN", {"default": False,
+                    "tooltip": "After flushing caches, also unload the loaded model from VRAM and run a full memory free. Equivalent to hitting ComfyUI's /free endpoint. OFF = ComfyUI keeps model resident between runs (default, fastest re-runs). ON = ~9 GB freed but next run pays reload cost."}),
+            },
         }
 
     @classmethod
     def IS_CHANGED(cls, *a, **k):
         return float("nan")
 
-    def flush(self, model, samples):
+    def flush(self, model, samples, auto_free_after_run=False, **_ignored):
         flushed_blockskip = 0
         flushed_crossattn = 0
 
@@ -1450,6 +1934,7 @@ class ShannonPrimeWanCacheFlush:
                         obj.get("ffn_cache", {}).clear()
                         obj.get("step_cached", {}).clear()
                         obj.get("hit_streak", {}).clear()
+                        obj.get("prev_attn_cache", {}).clear()
                         if n > 0:
                             flushed_blockskip += 1
 
@@ -1474,6 +1959,27 @@ class ShannonPrimeWanCacheFlush:
                   f"{flushed_crossattn} cross-attn caches + torch.cuda.empty_cache()")
         else:
             print("[SP CacheFlush] no caches found (node still safe to use)")
+
+        # v2 ergonomic: also unload the model from VRAM if requested.
+        # Uses comfy.model_management directly so we don't depend on the API
+        # being reachable from inside the node.
+        if auto_free_after_run:
+            try:
+                import comfy.model_management as mm
+                mm.unload_all_models()
+                mm.soft_empty_cache()
+                # Best-effort second pass — empty_cache is idempotent and cheap
+                try:
+                    torch.cuda.empty_cache()
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                print("[SP CacheFlush] auto_free_after_run: models unloaded, "
+                      "VRAM released")
+            except Exception as e:
+                print(f"[SP CacheFlush] auto_free_after_run failed: {e}")
 
         return (samples,)
 

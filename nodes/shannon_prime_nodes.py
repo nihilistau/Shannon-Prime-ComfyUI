@@ -2928,24 +2928,203 @@ class ShannonPrimeWanRicciSentinel:
         return (patched,)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# v6 — Lyapunov Snapshot diagnostic
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ShannonPrimeWanLyapunovSnapshot:
+    """
+    v6 diagnostic: capture per-block per-step cache fingerprints for
+    Lyapunov spectrum analysis. Run twice with two slightly different
+    prompts/seeds, save to two snapshot files, then run sp_lyapunov_analyze.py
+    on the pair to extract per-block divergence rates.
+
+    Output: a numpy .npz file with arrays:
+      blocks  : int array of block indices recorded
+      steps   : int array of denoising steps
+      fp      : float32 array shape [n_blocks, n_steps, fingerprint_dim]
+
+    Fingerprint: per-block-per-step, take y after self_attn, average over
+    the token axis, slice the first `fingerprint_dim` hidden-dim entries.
+    Cheap, dimension-stable, sufficient for cosine-divergence Lyapunov
+    fitting. Storage: at fp_dim=128 with 30 blocks × 30 steps that's
+    30 × 30 × 128 × 4 = 460 KB per run. Trivial.
+
+    Place this node anywhere in the graph between UnetLoader and KSampler;
+    it patches the same per-block forward as BlockSkip but only reads
+    (doesn't modify) the y output.
+    """
+
+    CATEGORY    = "shannon-prime"
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION    = "patch"
+    DESCRIPTION = (
+        "v6 diagnostic — record per-block per-step cache fingerprints "
+        "to a .npz file for offline Lyapunov spectrum analysis. Run twice "
+        "with slightly different prompts, then run scripts/sp_lyapunov_analyze.py "
+        "on the snapshot pair to validate the dynamical-systems framing "
+        "and auto-tune drift-gate thresholds."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "snapshot_path": ("STRING", {"default": "snapshots/run_a.npz",
+                    "tooltip": "Output path for the snapshot .npz file. Created/overwritten on each run."}),
+            },
+            "optional": {
+                "fingerprint_dim": ("INT", {"default": 128, "min": 32, "max": 1024,
+                    "tooltip": "Per-block-step fingerprint dimensionality. 128 is plenty for cosine-divergence fitting."}),
+                "max_steps": ("INT", {"default": 64, "min": 4, "max": 200,
+                    "tooltip": "Max denoising steps to record. Beyond this, the snapshot is finalized and the patch becomes a no-op for safety."}),
+                "verbose": ("BOOLEAN", {"default": False,
+                    "tooltip": "Print [SP Snapshot] log on every block-step recorded"}),
+            },
+        }
+
+    @classmethod
+    def IS_CHANGED(cls, *a, **k):
+        return float("nan")
+
+    def patch(self, model, snapshot_path, fingerprint_dim=128, max_steps=64,
+              verbose=False, **_ignored):
+        import os
+        import pathlib
+        import numpy as _np
+
+        patched = model.clone()
+        blocks  = list(_iter_wan_blocks(patched))
+        if not blocks:
+            print("[SP Snapshot] no Wan blocks found — passing through")
+            return (patched,)
+
+        # Make sure the output dir exists
+        try:
+            out_path = pathlib.Path(snapshot_path)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            print(f"[SP Snapshot] could not prepare output dir: {e}")
+
+        # ── Snapshot state ────────────────────────────────────────────────
+        snap = {
+            'fingerprints': {},     # block_idx -> {step: np.ndarray[fp_dim]}
+            'global_step':  [0],
+            'output_path':  snapshot_path,
+            'fp_dim':       int(fingerprint_dim),
+            'max_steps':    int(max_steps),
+            'final_written': [False],
+        }
+
+        n_blocks = len(blocks)
+
+        def _make_snapshot_forward(orig_forward, block_idx):
+            def snap_forward(x, e, freqs, context,
+                             context_img_len=257,
+                             transformer_options={}):
+                # Step counter on block-0
+                if block_idx == 0:
+                    snap['global_step'][0] += 1
+                step = snap['global_step'][0]
+
+                # Run the original forward unchanged. We capture the y
+                # produced by its self-attention via a small intercept.
+                # Easiest path: call the original and then capture x_after
+                # = (post-block x) — pre-block x. That delta encodes the
+                # block's contribution. For Lyapunov purposes the delta is
+                # what diverges between the two runs.
+                if step <= snap['max_steps']:
+                    try:
+                        x_pre = x.detach().float().mean(dim=1).flatten()  # [B*hidden]
+                    except Exception:
+                        x_pre = None
+                else:
+                    x_pre = None
+
+                out = orig_forward(x, e, freqs, context,
+                                   context_img_len=context_img_len,
+                                   transformer_options=transformer_options)
+
+                if x_pre is not None:
+                    try:
+                        x_post = out.detach().float().mean(dim=1).flatten()
+                        delta = (x_post - x_pre)[:snap['fp_dim']].cpu().numpy()
+                        snap['fingerprints'].setdefault(block_idx, {})[step] = delta
+                        if verbose and block_idx == 0:
+                            print(f"[SP Snapshot] step={step} recorded "
+                                  f"(blocks so far this step: 1)")
+                        # On the LAST block of the LAST step, write to disk
+                        if (block_idx == n_blocks - 1 and step >= snap['max_steps']
+                                and not snap['final_written'][0]):
+                            _save_snapshot(snap)
+                            snap['final_written'][0] = True
+                    except Exception:
+                        pass
+
+                return out
+            return snap_forward
+
+        def _save_snapshot(s):
+            try:
+                fps = s['fingerprints']
+                if not fps:
+                    return
+                blocks_recorded = sorted(fps.keys())
+                # Determine maximum step seen
+                max_step = max(max(steps_dict.keys())
+                               for steps_dict in fps.values())
+                fp_dim = s['fp_dim']
+                arr = _np.zeros((len(blocks_recorded), max_step, fp_dim),
+                                dtype=_np.float32)
+                for bi, b in enumerate(blocks_recorded):
+                    for step, vec in fps[b].items():
+                        if 1 <= step <= max_step and vec.shape[0] == fp_dim:
+                            arr[bi, step - 1] = vec
+                _np.savez_compressed(
+                    s['output_path'],
+                    blocks=_np.array(blocks_recorded, dtype=_np.int32),
+                    steps=_np.arange(1, max_step + 1, dtype=_np.int32),
+                    fp=arr,
+                )
+                print(f"[SP Snapshot] wrote {s['output_path']} "
+                      f"({len(blocks_recorded)} blocks × {max_step} steps × {fp_dim} dim)")
+            except Exception as ex:
+                print(f"[SP Snapshot] save failed: {ex}")
+
+        # Patch every block (light wrapper — only reads, doesn't modify y)
+        for i, blk in blocks:
+            orig = blk.forward
+            blk.forward = _make_snapshot_forward(orig, i)
+
+        # Also expose a save function via the model for explicit dump
+        patched._sp_lyapunov_snapshot_state = snap
+
+        print(f"[SP Snapshot] patched {n_blocks} blocks, recording → {snapshot_path}")
+        print(f"[SP Snapshot] fingerprint_dim={fingerprint_dim}, max_steps={max_steps}")
+        return (patched,)
+
+
 NODE_CLASS_MAPPINGS = {
-    "ShannonPrimeWanCache":           ShannonPrimeWanCache,
-    "ShannonPrimeWanCacheStats":      ShannonPrimeWanCacheStats,
-    "ShannonPrimeWanCacheSqfree":     ShannonPrimeWanCacheSqfree,
-    "ShannonPrimeWanSelfExtract":     ShannonPrimeWanSelfExtract,
-    "ShannonPrimeWanBlockSkip":       ShannonPrimeWanBlockSkip,
-    "ShannonPrimeWanCacheFlush":      ShannonPrimeWanCacheFlush,
-    "ShannonPrimeWanSigmaSwitch":     ShannonPrimeWanSigmaSwitch,
-    "ShannonPrimeWanRicciSentinel":   ShannonPrimeWanRicciSentinel,
+    "ShannonPrimeWanCache":             ShannonPrimeWanCache,
+    "ShannonPrimeWanCacheStats":        ShannonPrimeWanCacheStats,
+    "ShannonPrimeWanCacheSqfree":       ShannonPrimeWanCacheSqfree,
+    "ShannonPrimeWanSelfExtract":       ShannonPrimeWanSelfExtract,
+    "ShannonPrimeWanBlockSkip":         ShannonPrimeWanBlockSkip,
+    "ShannonPrimeWanCacheFlush":        ShannonPrimeWanCacheFlush,
+    "ShannonPrimeWanSigmaSwitch":       ShannonPrimeWanSigmaSwitch,
+    "ShannonPrimeWanRicciSentinel":     ShannonPrimeWanRicciSentinel,
+    "ShannonPrimeWanLyapunovSnapshot":  ShannonPrimeWanLyapunovSnapshot,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ShannonPrimeWanCache":           "Shannon-Prime: Wan Cross-Attn Cache",
-    "ShannonPrimeWanCacheStats":      "Shannon-Prime: Cache Stats",
-    "ShannonPrimeWanCacheSqfree":     "Shannon-Prime: Wan Cross-Attn Cache (Sqfree)",
-    "ShannonPrimeWanSelfExtract":     "Shannon-Prime: Wan Self-Attn Extract (Phase 12)",
-    "ShannonPrimeWanBlockSkip":       "Shannon-Prime: Wan Block-Level Self-Attn Skip (VHT2)",
-    "ShannonPrimeWanCacheFlush":      "Shannon-Prime: Wan Block Cache Flush (before VAE)",
-    "ShannonPrimeWanSigmaSwitch":     "Shannon-Prime: Wan Sigma Switch (Phase 13)",
-    "ShannonPrimeWanRicciSentinel":   "Shannon-Prime: Wan Ricci Sentinel (Phase 13 diag)",
+    "ShannonPrimeWanCache":             "Shannon-Prime: Wan Cross-Attn Cache",
+    "ShannonPrimeWanCacheStats":        "Shannon-Prime: Cache Stats",
+    "ShannonPrimeWanCacheSqfree":       "Shannon-Prime: Wan Cross-Attn Cache (Sqfree)",
+    "ShannonPrimeWanSelfExtract":       "Shannon-Prime: Wan Self-Attn Extract (Phase 12)",
+    "ShannonPrimeWanBlockSkip":         "Shannon-Prime: Wan Block-Level Self-Attn Skip (VHT2)",
+    "ShannonPrimeWanCacheFlush":        "Shannon-Prime: Wan Block Cache Flush (before VAE)",
+    "ShannonPrimeWanSigmaSwitch":       "Shannon-Prime: Wan Sigma Switch (Phase 13)",
+    "ShannonPrimeWanRicciSentinel":     "Shannon-Prime: Wan Ricci Sentinel (Phase 13 diag)",
+    "ShannonPrimeWanLyapunovSnapshot":  "Shannon-Prime: Wan Lyapunov Snapshot (v6 diag)",
 }

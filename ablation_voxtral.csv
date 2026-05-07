@@ -1,0 +1,3 @@
+name,runs_ok,runs_total,mean_s,stdev_s,min_s,max_s,vram_peak_gb,error,params
+vox-baseline,0,1,,,,,,"Prompt outputs failed validation | node 2: Bad linked input, must be a length-2 list of [node_id, slot_index]","{""k_band_bits"": ""5,5,4,3""}"
+vox-ternary-tail,0,1,,,,,,"Prompt outputs failed validation | node 2: Bad linked input, must be a length-2 list of [node_id, slot_index]","{""k_band_bits"": ""5,5,4,3"", ""k_ternary_bands"": ""3""}"

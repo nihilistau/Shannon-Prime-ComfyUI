@@ -1,0 +1,5 @@
+name,runs_ok,runs_total,mean_s,stdev_s,min_s,max_s,vram_peak_gb,error,params
+baseline,1,1,688.9880208969116,,688.9880208969116,688.9880208969116,8.65,,"{""enable_drift_gate"": false, ""enable_sigma_streak"": false, ""enable_twin_borrow"": false}"
+gate-only,0,1,,,,,9.68,wait_timeout_or_error,"{""enable_drift_gate"": true, ""enable_sigma_streak"": false, ""enable_twin_borrow"": false}"
+streak-only,1,1,592.7331383228302,,592.7331383228302,592.7331383228302,8.65,,"{""enable_drift_gate"": false, ""enable_sigma_streak"": true, ""enable_twin_borrow"": false}"
+gate+streak,0,1,,,,,9.68,wait_timeout_or_error,"{""enable_drift_gate"": true, ""enable_sigma_streak"": true, ""enable_twin_borrow"": false}"
